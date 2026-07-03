@@ -2,6 +2,10 @@
 
 SXM Viewer is a Python-based desktop application for scientific SPM (Scanning Probe Microscopy) data analysis and visualization, designed for Anfatec/Omicron systems. But also Nanonis. Maybe in the future Matrix. We will see.
 
+> **Attribution:** The original SXM Viewer is developed by Ex-libris and available at
+> https://github.com/Ex-libris/sxm_viewer. This repository extends it with the in-house
+> MISO molecule-analysis tools.
+
 ---
 
 ## Documentation
@@ -99,6 +103,8 @@ script or terminal required.
 - On success, results are written to a `results/` folder next to the CSV, and every
   exported `.sdf` is auto-converted to `.mol` and `.mol2`
 
+> The runner uses only the YAML + CSV (uniform surface gravity). It does not require
+> the STM grid NPZ.
 
 ### Workflow
 

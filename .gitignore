@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor state
+.vscode/
+.idea/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project-specific large data directories
+data/
+offline_bundle/
+test_xyz_exports/
+backup_2/
+# Keep source helpers tracked even though they live under `sxm_viewer/data`
+!sxm_viewer/data/
+!sxm_viewer/data/**
+# But still ignore cache artifacts there
+sxm_viewer/data/**/__pycache__/
+sxm_viewer/data/**/*.py[cod]
+sxm_viewer/data/**/*$py.class
+
+# Logs & temporary files
+*.log
+*.tmp
+
+# Nanonis cache artifacts
+.sxmviewer_nanonis/
+
+# Local context notes (keep untracked)
+CONTEXT.md
+
+# local test data and temporary caches
+*.sxm
+*.dat
+**/.nanonis_*
