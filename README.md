@@ -55,6 +55,8 @@ See the full installation guide in the MkDocs site for the Windows installer hel
 ---
 ## MISO Tools
 
+<img src="miso.png" alt="MISO" width="220">
+
 MISO is an in-house extension of SXM Viewer for molecule analysis on STM images. It provides a set of tools that bridge the SXM Viewer interface with the MISO processing pipeline.
 
 ### Overview
