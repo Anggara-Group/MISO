@@ -1,0 +1,80 @@
+sxm_file: 'fa_04.sxm'  
+circle_input_path: 'fa_coordinates.csv'
+# stm_grid_path: 'fa.npz'
+
+sugars:
+  GlcNAc: 'CC(=O)N[C@@H]1[C@H]([C@@H]([C@H](OC1O)CO)O)O'
+  Fuc: 'C[C@H]1[C@H]([C@H]([C@@H](C(O1)O)O)O)O'
+  Man: 'C([C@@H]1[C@H]([C@@H]([C@@H](C(O1)O)O)O)O)O'
+
+experimental_positions:
+  GlcNAc: [2,4,7,10]
+  Fuc: 9
+  Man: [0,3,5]
+
+conformer_parameters:
+  num_conformers: 20
+  max_keep: 3
+
+conformer_selection:
+  strategy: 'lowest_energy'
+
+root_mol: 'Fuc'
+
+direction:
+  - ['GlcNAc_2', 'C1', 'Man_0', 'C2']
+  - ['GlcNAc_2', 'C2', [1]]
+  - ['Man_0', 'C1', 'Man_3', 'C6']
+  - ['Man_3', 'C3', 'Man_5', 'C1']
+  - ['Man_5', 'C2', 'GlcNAc_4', 'C1']
+  - ['GlcNAc_4', 'C2', [6]]
+  - ['Man_3', 'C1', 'GlcNAc_7', 'C4']
+  # - ['GlcNAc_7', 'C2', [8]]
+  - ['GlcNAc_7', 'C1', 'GlcNAc_10', 'C4']
+  - ['GlcNAc_10', 'C3', 'Fuc', 'C1']
+  # - ['GlcNAc_10', 'C2', [11]]
+  - ['GlcNAc_10', 'C1', [12]]
+
+peptide:
+  sequence: 'K-V-A-N-K-T'  # Chain: Asn(0) → Phe(1) → Ala(2)
+  residues:
+    - aa: 'Lys'      # Residue 0 in chain
+      ca_position: 15
+      functional_position: 16
+    - aa: 'Val'      # Residue 1 in chain
+      ca_position: 13
+      functional_position: 14
+    - aa: 'Ala'      # Residue 2 in chain
+      ca_position: 12
+      functional_position: null
+    - aa: 'Asn'      # Residue 2 in chain
+      ca_position: 21
+      functional_position: 22
+    - aa: 'Lys'      # Residue 2 in chain
+      ca_position: 17
+      functional_position: 18
+    - aa: 'Thr'      # Residue 2 in chain
+      ca_position: 19
+      functional_position: 20
+peptide_bonds:
+  - sugar_mol: 'GlcNAc_10'
+    sugar_carbon: 'C1'
+    aa_type: 'Asn'
+    residue_index: 3
+    glycosylation_type: 'N-glycosidic'
+    anomeric_config: 'beta'
+    use_spacer: false
+
+glycosidic_bonds:
+- ['GlcNAc_2', 'C1', 'Man_0', 'C2', 'beta', 'GlcNAc_0-Man_2 beta(1-2)']
+- ['Man_0', 'C1', 'Man_3', 'C6', 'alpha', 'Man_2-Man_3 alpha(1-6)']
+- ['Man_3', 'C3', 'Man_5', 'C1', 'alpha', 'Man_3-Man_4 alpha(3-1)']
+- ['Man_5', 'C2', 'GlcNAc_4', 'C1', 'beta', 'Man_4-GlcNAc_5 beta(2-1)']
+- ['Man_3', 'C1', 'GlcNAc_7', 'C4', 'beta', 'Man_3-GlcNAc_7 beta(1-4)']
+- ['GlcNAc_7', 'C1', 'GlcNAc_10', 'C4', 'beta', 'GlcNAc_7-GlcNAc_10 beta(1-4)']
+- ['GlcNAc_10', 'C3', 'Fuc', 'C1', 'alpha', 'GlcNAc_10-Fuc_11 alpha(3-1)']
+
+orientation_constraints:
+  # Glc_0: flat
+  # Glc_1: flat
+
