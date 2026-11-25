@@ -290,9 +290,298 @@ def extract_initial_ring_coms_from_monomers(molecule_data_dict, final_no_h, pyra
 # CHAIN BUILDING
 # ============================================================================
 
-def build_glycan_chain(molecule_data_dict, config, iterations):
+def _resolve_input_path(path, base_dir=None):
+    """A path from the yaml: as given if it exists or is absolute, else next to the yaml."""
+    if not path:
+        return None
+    if os.path.isabs(path) or os.path.exists(path) or not base_dir:
+        return path
+    return os.path.join(base_dir, path)
+
+
+def load_monomer_data(monomer_data_path, sugars, experimental_positions, base_dir=None):
+    """
+    Load the monomer geometry exported by the GUI (``monomer_data_path`` in the
+    yaml) instead of generating conformers.
+
+    The pickle holds {sugar type: {conformer name: rigid monomer data}}, the
+    output of extract_monomer_data (relative_coordinates, atom_types,
+    carbon_map, oh_map, COM, quaternion, ...), with conformer names as in the
+    orientation CSV's Conformer column.
+
+    Returns (monomer_data, conformers).  conformers gives the exporter one
+    RDKit molecule per sugar type for the bond topology, built from the
+    SMILES (heavy atoms, as the generated conformers are); its atom count is
+    checked against the pickle so coordinates and topology line up.
+    """
+    import pickle
+    from rdkit.Chem import AllChem
+    path = _resolve_input_path(monomer_data_path, base_dir)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"monomer_data_path not found: {path}")
+    with open(path, 'rb') as fh:
+        monomer_data = pickle.load(fh)
+    if not isinstance(monomer_data, dict):
+        raise ValueError(f"monomer_data_path {path}: expected {{sugar type: {{conformer: data}}}}")
+    missing = [s for s in experimental_positions if s not in monomer_data]
+    if missing:
+        raise KeyError(f"monomer_data_path {path} has no entry for {missing} "
+                       f"(has {sorted(monomer_data)})")
+    conformers = {}
+    for sugar in experimental_positions:
+        confs = monomer_data[sugar]
+        if not isinstance(confs, dict) or not confs or \
+                not all(isinstance(v, dict) and 'relative_coordinates' in v for v in confs.values()):
+            raise ValueError(f"monomer_data_path {path}: entry {sugar!r} must map conformer names "
+                             f"to monomer data with relative_coordinates")
+        if sugar not in sugars:
+            raise KeyError(f"monomer_data_path: {sugar} has no SMILES under 'sugars' in the yaml")
+        mol = Chem.MolFromSmiles(sugars[sugar])
+        if mol is None:
+            raise ValueError(f"SMILES for {sugar} could not be parsed")
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        for name, data in confs.items():
+            n = len(data['relative_coordinates'])
+            if n != mol.GetNumAtoms():
+                raise ValueError(f"monomer_data_path: {sugar} conformer {name} has {n} atoms, "
+                                 f"the SMILES gives {mol.GetNumAtoms()}: not the same molecule")
+        conformers[sugar] = {'_topology': {'molecule': mol}}
+    print(f"\n  Loaded monomer geometry for {len(conformers)} sugar type(s) from {path} "
+          f"(conformer generation skipped): "
+          + ", ".join(f"{s} ({len(monomer_data[s])} conformers)" for s in conformers))
+    return monomer_data, conformers
+
+
+ORIENTATION_CSV_COLUMNS = ['Point', 'Instance', 'Type', 'Conformer',
+                           'quat_x', 'quat_y', 'quat_z', 'quat_w',
+                           'R00', 'R01', 'R02', 'R10', 'R11', 'R12', 'R20', 'R21', 'R22']
+
+
+def _truthy(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _point_to_molecule(experimental_positions):
+    """circle index -> (molecule key in molecule_data_dict, sugar type)."""
+    out = {}
+    for sugar, positions in experimental_positions.items():
+        if isinstance(positions, list):
+            for pos in positions:
+                out[int(pos)] = (f"{sugar}_{pos}", sugar)
+        else:
+            out[int(positions)] = (sugar, sugar)
+    return out
+
+
+def apply_defined_orientations(config, molecule_data_dict, translated_conformers,
+                               base_dir=None):
+    """
+    User defined orientations: with ``use_fixed_orientation: true`` and an
+    ``orientation_csv_path`` in the yaml, every sugar listed in the CSV takes
+    that rotation instead of a QUEST search.
+
+    The CSV (written by the GUI's _export_miso_inputs) has one row per placed
+    subunit: Point (the circle index used in experimental_positions), Instance,
+    Type ('sugar' or 'aa'), Conformer, quat_x..quat_w and the row major 3x3
+    rotation R00..R22.  For each sugar row:
+
+    1. the named conformer is used when it exists in this run;
+    2. the template is rotated about its COM by R (absolute = COM + R @ rel),
+       R taken from the matrix; the quaternion is only checked against it;
+    3. the molecule is marked fixed_orientation: the builder skips QUEST, its
+       face is not enumerated, the joint rotation does not rotate it.  The
+       rigid REFINE still rotates it as a rigid body to relax the bonds.
+
+    R must be a proper rotation (det +1): a reflection would turn the sugar
+    into its enantiomer, so it is refused.  'aa' rows are not used here.
+
+    Modifies molecule_data_dict in place.  Returns {molecule key: info} for
+    the sugars that were set, or {} when the feature is off.
+    """
+    import pandas as pd
+    from scipy.spatial.transform import Rotation as _Rot
+    from src.rotation_optimization.geometry.geometry_utils import rotate_molecule_around_com
+    from src.rotation_optimization.rotation.rotation_optimization import face_sign
+
+    use = _truthy(config.get('use_fixed_orientation', False))
+    path = _resolve_input_path(config.get('orientation_csv_path'), base_dir)
+    if not use:
+        if path:
+            print(f"\n  orientation_csv_path given but use_fixed_orientation is off: "
+                  f"QUEST orients every sugar")
+        return {}
+    if not path:
+        raise ValueError("use_fixed_orientation is true but orientation_csv_path is not set")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"orientation_csv_path not found: {path}")
+
+    df = pd.read_csv(path)
+    missing = [c for c in ORIENTATION_CSV_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"orientation CSV {path} lacks columns: {', '.join(missing)}")
+
+    print("\n" + "=" * 70)
+    print("USER DEFINED ORIENTATIONS (no QUEST for these sugars)")
+    print("=" * 70)
+    print(f"  {path}")
+    point_map = _point_to_molecule(config['experimental_positions'])
+    applied = {}
+    for _, row in df.iterrows():
+        kind = str(row['Type']).strip().lower()
+        point = int(row['Point'])
+        if kind != 'sugar':
+            print(f"  Point {point} ({row['Instance']}): type {kind}, not used")
+            continue
+        if point not in point_map:
+            print(f"  ! Point {point} ({row['Instance']}): not in experimental_positions, skipped")
+            continue
+        key, sugar = point_map[point]
+        if key not in molecule_data_dict:
+            print(f"  ! Point {point}: molecule {key} not built, skipped")
+            continue
+        if str(row['Instance']).strip() != key:
+            print(f"  ! Point {point}: CSV instance {row['Instance']} is molecule {key} here "
+                  f"(matched by point)")
+
+        Rm = np.array([[row['R00'], row['R01'], row['R02']],
+                       [row['R10'], row['R11'], row['R12']],
+                       [row['R20'], row['R21'], row['R22']]], dtype=float)
+        orth = float(np.abs(Rm @ Rm.T - np.eye(3)).max())
+        det = float(np.linalg.det(Rm))
+        if orth > 1e-3 or abs(det - 1.0) > 1e-3:
+            raise ValueError(f"orientation CSV point {point} ({key}): R is not a proper rotation "
+                             f"(det {det:+.4f}, orthonormality error {orth:.1e}); a reflection "
+                             f"would turn the sugar into its enantiomer")
+        q = np.array([row['quat_x'], row['quat_y'], row['quat_z'], row['quat_w']], dtype=float)
+        q_note = ''
+        if np.linalg.norm(q) > 1e-9:
+            Rq = _Rot.from_quat(q).as_matrix()
+            if np.abs(Rq - Rm).max() > 1e-3:
+                q_note = (' (quaternion is the transpose of R)' if np.abs(Rq.T - Rm).max() < 1e-3
+                          else ' (quaternion differs from R)')
+                q_note = '  ! ' + q_note.strip(' ()') + '; R used'
+
+        # conformer chosen by the user, when this run has it
+        confs = translated_conformers.get(sugar, {})
+        if isinstance(config['experimental_positions'][sugar], list):
+            confs = confs.get(point, {})
+        conf_name = str(row['Conformer']).strip()
+        md = molecule_data_dict[key]
+        conf_note = ''
+        if conf_name in confs:
+            brightness = md.get('brightness')
+            md = dict(confs[conf_name])
+            if brightness is not None:
+                md['brightness'] = brightness
+        else:
+            conf_note = (f"  ! conformer {conf_name} not generated in this run, "
+                         f"using the selected one")
+        if 'quaternion' not in md:
+            md['quaternion'] = [0.0, 0.0, 0.0, 1.0]
+        md = rotate_molecule_around_com(md, Rm)
+        md['fixed_orientation'] = True
+        md['user_rotation'] = Rm.tolist()
+        molecule_data_dict[key] = md
+        f = face_sign(md)
+        applied[key] = {'point': point, 'conformer': conf_name if not conf_note else None,
+                        'face': f}
+        print(f"  {key} (point {point}): rotation set, face {f:+d}"
+              f"{', conformer ' + conf_name if not conf_note else ''}{q_note}{conf_note}")
+    print(f"  {len(applied)} sugars with a user defined orientation; the others use QUEST")
+    return applied
+
+
+def fixed_orientation_molecules(molecule_data_dict):
+    """Names of molecules whose orientation the user defined."""
+    return {m for m, md in molecule_data_dict.items() if md.get('fixed_orientation')}
+
+
+def _glycosidic_linkages(config):
+    """Normalised glycosidic linkages (falls back to 'direction')."""
+    links = config.get('glycosidic_bonds') or config['direction']
+    return building_chain.normalize_linkage_definitions([tuple(l) for l in links])
+
+
+def plan_face_states(molecule_data_dict, config, n_polymers, seed=0, pool_factor=4,
+                     screen=True):
+    """
+    Decide which face states to try, in order.
+
+    1. Every sugar is screened (face_screening.screen_faces): faces that
+       cannot reach all of the sugar's linkage partners at once are removed.
+    2. States are drawn only from the remaining faces: all of them if they
+       fit in the pool, otherwise the first allowed state plus a seeded
+       random sample.  The pool holds up to pool_factor * n_polymers states
+       so that states rejected later by the joint rotation can be replaced.
+
+    Returns
+    -------
+    (mol_order, states, screening)
+        mol_order : monomers in positioning order (root first); the
+                    character order of the face labels ('0' = +1 face up).
+        states    : list of {mol_name: +1 or -1}, the pool, in try order.
+        screening : screen_faces output (None when screen=False).
+    """
+    from src.rotation_optimization.rotation.rotation_optimization import ring_atom_order
+    from src.rotation_optimization.rotation.face_screening import screen_faces
+    rotation_definitions = [tuple(link) for link in config['direction']]
+    mol_order = building_chain.chain_molecule_order(
+        rotation_definitions, config['root_mol'], molecule_data_dict)
+    faceable = [m for m in mol_order
+                if m in molecule_data_dict and ring_atom_order(molecule_data_dict[m]) is not None]
+    screening = None
+    allowed = None
+    if screen:
+        screening = screen_faces(molecule_data_dict, _glycosidic_linkages(config), seed=seed)
+        allowed = {m: screening[m]['valid'] for m in mol_order if m in screening}
+    # A user defined orientation fixes the face: it is not enumerated.
+    from src.rotation_optimization.rotation.rotation_optimization import face_sign
+    fixed_face = {}
+    for m in fixed_orientation_molecules(molecule_data_dict):
+        if m in faceable:
+            fixed_face[m] = face_sign(molecule_data_dict[m])
+    if fixed_face:
+        allowed = dict(allowed or {})
+        for m, f in fixed_face.items():
+            if f in (1, -1):
+                allowed[m] = [f]
+        faceable = [m for m in faceable if fixed_face.get(m, 1) != 0]
+    n_pool = max(n_polymers, pool_factor * n_polymers)
+    states = building_chain.generate_face_states(
+        mol_order, n_pool, seed=seed, faceable=faceable, allowed=allowed)
+    for st in states:
+        for m, f in fixed_face.items():
+            if f == 0 and m in st:          # user rotation puts the ring edge on
+                st[m] = 0
+    return mol_order, states, screening
+
+
+def chain_coordinates(chain_dict, mol_order):
+    """Concatenated absolute coordinates of the monomers in mol_order."""
+    return np.vstack([np.asarray(chain_dict[m]['absolute_coordinates'], dtype=float)
+                      for m in mol_order if m in chain_dict])
+
+
+def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, seed=None,
+                       joint_rotation=True, max_gap=6.0, return_report=False):
     """
     Align molecules and create glycosidic bonds.
+
+    face_state : dict or None
+        {mol_name: +1 or -1}, the face each ring must present upward
+        (see plan_face_states).  None keeps the previous behaviour.
+    seed : int or None
+        Seed for the fallback rotation sampling.
+    joint_rotation : bool
+        With a face_state, rotate all sugars together about their fixed
+        COMs to close every linkage (joint_rotation.joint_rigid_rotation)
+        before the bonds are created.
+    max_gap : float
+        Linkage C...C above which the joint step rejects the state.
+    return_report : bool
+        Also return the joint rotation report (None when it did not run).
     
     Returns:
         tuple: (chain_dict, bonds_glyco, sorted_linkages)
@@ -314,7 +603,6 @@ def build_glycan_chain(molecule_data_dict, config, iterations):
     
     linkage_definitions = [tuple(link) for link in config['glycosidic_bonds']]
     rotation_definitions = [tuple(link) for link in config['direction']]
-    orientation_constraints = config.get('orientation_constraints', False)
 
     print(f"\nrotation_definitions (after tuple conversion):")
     for r in rotation_definitions:
@@ -326,9 +614,17 @@ def build_glycan_chain(molecule_data_dict, config, iterations):
         rotation_definitions,
         root_mol=config['root_mol'],
         iterations=iterations,
-        orientation_constraints=None
+        face_state=face_state,
+        seed=seed
     )
     
+    report = None
+    if face_state is not None and joint_rotation:
+        from src.rotation_optimization.rotation.joint_rotation import joint_rigid_rotation
+        chain_dict, report = joint_rigid_rotation(
+            chain_dict, _glycosidic_linkages(config), face_state, max_gap=max_gap,
+            fixed=fixed_orientation_molecules(molecule_data_dict))
+
     print("\nCreating glycosidic bonds...")
     bonds_glyco = building_chain.create_glycosidic_bonds_in_chain(
         chain_dict, linkage_definitions
@@ -337,6 +633,8 @@ def build_glycan_chain(molecule_data_dict, config, iterations):
     print(f"\n✓ Built chain with {len(chain_dict)} molecules")
     print(f"✓ Created {len(bonds_glyco)} glycosidic bonds")
     
+    if return_report:
+        return chain_dict, bonds_glyco, sorted_linkages, report
     return chain_dict, bonds_glyco, sorted_linkages
 
 def build_glycan_chain_TOP_N(molecule_data_dict, config, iterations, n_polymers=5, n_quest_variants=6):
@@ -373,7 +671,6 @@ def build_glycan_chain_TOP_N(molecule_data_dict, config, iterations, n_polymers=
     
     linkage_definitions = [tuple(link) for link in config['glycosidic_bonds']]
     rotation_definitions = [tuple(link) for link in config['direction']]
-    orientation_constraints = config.get('orientation_constraints', None)
     
     print(f"\nrotation_definitions (after tuple conversion):")
     for r in rotation_definitions:
@@ -383,7 +680,6 @@ def build_glycan_chain_TOP_N(molecule_data_dict, config, iterations, n_polymers=
     polymer_list, sorted_linkages = building_chain.align_and_position_molecules_TOP_N_POLYMERS(
         molecule_data_dict, 
         rotation_definitions,
-        orientation_constraints=orientation_constraints,
         root_mol=config['root_mol'],
         iterations=iterations,
         n_polymers=n_polymers,
@@ -566,11 +862,126 @@ def add_petn_modifications(config, chain_dict, circles):
 # LIPID CHAINS
 # ============================================================================
 
+def lipid_source_dict(molecule_data_dict, chain_dict, unbonded_monomers=None):
+    """The molecules lipids are built on: each sugar as positioned in this
+    polymer (chain_dict, then phosphate attached monomers), falling back to the
+    template only for molecules the chain does not hold.  Lipids used to be
+    built on the template, the sugar before QUEST and the joint rotation turned
+    it, so the lipid did not start at the sugar carbon it is bonded to."""
+    src = dict(molecule_data_dict)
+    src.update(unbonded_monomers or {})
+    src.update(chain_dict or {})
+    return src
+
+
+def lipid_pins(mol, lipids, tol=0.05):
+    """Atoms to pin in REFINE: for every lipid, the carbon built on its
+    midpoint and the carbon built on its tip, with the point's xy.
+
+    Returns [{'atom': index, 'xy': (x, y), 'label': str}].  Carbons are found
+    in *mol* by position (the exporter copies the builder's coordinates)."""
+    if not lipids:
+        return []
+    conf = mol.GetConformer()
+    pos = np.array(conf.GetPositions())
+    carbons = np.array([a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'C'])
+    pins = []
+    for k, lip in enumerate(lipids):
+        chain = lip.get('chain_carbons') or []
+        name = f"lipid {k + 1} ({lip.get('mol_name')}.{lip.get('carbon_name')})"
+        for which, ikey, tkey in (('midpoint', 'mid_carbon_index', 'mid_target'),
+                                  ('tip', 'end_carbon_index', 'end_target')):
+            i, target = lip.get(ikey), lip.get(tkey)
+            if i is None or target is None or i >= len(chain):
+                continue
+            d = np.linalg.norm(pos[carbons] - np.asarray(chain[i]), axis=1)
+            j = int(np.argmin(d))
+            if d[j] > tol:
+                print(f"  ! {name}: {which} carbon not found in the structure "
+                      f"(nearest carbon {d[j]:.2f} A away); not pinned")
+                continue
+            pins.append({'atom': int(carbons[j]), 'xy': (float(target[0]), float(target[1])),
+                         'label': f"{name} {which}"})
+    return pins
+
+
+
+def lipid_atoms(mol, lipids, tol=0.05):
+    """Find each lipid's atoms in *mol* by position (the exporter copies the
+    builder's coordinates): the atom it hangs from (sugar carbon or parent
+    chain carbon), the linkage atom, the chain carbons (carbonyl C first for
+    amide and ester), and the midpoint and tip carbons.  Lipids whose atoms
+    cannot all be found are skipped with a note."""
+    if not lipids:
+        return []
+    pos = np.array(mol.GetConformer().GetPositions())
+
+    def find(xyz):
+        d = np.linalg.norm(pos - np.asarray(xyz, dtype=float), axis=1)
+        j = int(np.argmin(d))
+        return j if d[j] <= tol else None
+
+    out = []
+    for k, lip in enumerate(lipids):
+        name = f"lipid {k + 1} ({lip.get('mol_name')}.{lip.get('carbon_name')})"
+        link_xyz = (lip.get('n_link_position') or lip.get('o_ester_position')
+                    or lip.get('o_ether_position'))
+        chain_xyz = list(lip.get('chain_carbons') or [])
+        if lip.get('c_carbonyl_position') is not None:
+            chain_xyz = [lip['c_carbonyl_position']] + chain_xyz
+        anchor = find(lip['sugar_carbon']) if lip.get('sugar_carbon') is not None else None
+        link = find(link_xyz) if link_xyz is not None else None
+        chain = [find(c) for c in chain_xyz]
+        if anchor is None or link is None or any(c is None for c in chain):
+            print(f"  ! {name}: atoms not found in the structure; left out of the lipid report")
+            continue
+        off = 1 if lip.get('c_carbonyl_position') is not None else 0
+        mi, ei = lip.get('mid_carbon_index'), lip.get('end_carbon_index')
+        out.append({'label': name, 'linkage': lip.get('linkage'),
+                    'branched': bool(lip.get('is_branched')),
+                    'n_requested': lip.get('n_requested'), 'n_used': lip.get('n_carbons'),
+                    'anchor': anchor, 'link': link, 'chain': chain,
+                    'mid': chain[mi + off] if mi is not None else None,
+                    'tip': chain[ei + off] if ei is not None else None,
+                    'mid_target': lip.get('mid_target'), 'tip_target': lip.get('end_target')})
+    return out
+
+
+def lipid_geometry(mol, info):
+    """Geometry of one lipid (an entry of lipid_atoms) in *mol*: bond to the
+    sugar (or parent chain), C-C and C-C-C ranges along the chain, chain
+    height range, height spread of the tail (second half of the chain), and
+    the xy offsets of the midpoint and tip carbons from their points."""
+    P = np.array(mol.GetConformer().GetPositions())
+    ch = info['chain']
+    bonds = [float(np.linalg.norm(P[ch[i + 1]] - P[ch[i]])) for i in range(len(ch) - 1)]
+    angs = []
+    for i in range(1, len(ch) - 1):
+        v1, v2 = P[ch[i - 1]] - P[ch[i]], P[ch[i + 1]] - P[ch[i]]
+        angs.append(float(np.degrees(np.arccos(np.clip(
+            v1 @ v2 / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1)))))
+    tail = ch[len(ch) // 2:]
+
+    def off(atom, target):
+        if atom is None or target is None:
+            return None
+        return float(np.linalg.norm(P[atom, :2] - np.asarray(target[:2], dtype=float)))
+
+    return {'anchor_bond': float(np.linalg.norm(P[info['link']] - P[info['anchor']])),
+            'cc_min': min(bonds, default=0.0), 'cc_max': max(bonds, default=0.0),
+            'ccc_min': min(angs, default=0.0), 'ccc_max': max(angs, default=0.0),
+            'z_min': float(P[ch, 2].min()), 'z_max': float(P[ch, 2].max()),
+            'tail_z_spread': float(np.ptp(P[tail, 2])),
+            'mid_off': off(info['mid'], info['mid_target']),
+            'tip_off': off(info['tip'], info['tip_target'])}
+
+
 def initialize_lipid_storage(molecule_data_dict):
-    """Initialize lipid_chains list in each molecule."""
+    """Start every molecule with an empty lipid_chains list.  Fresh per call:
+    the dicts can be shared between polymers, and appending to a list left
+    from an earlier polymer piled up one lipid per polymer."""
     for mol_name in molecule_data_dict:
-        if 'lipid_chains' not in molecule_data_dict[mol_name]:
-            molecule_data_dict[mol_name]['lipid_chains'] = []
+        molecule_data_dict[mol_name]['lipid_chains'] = []
 
 def add_lipid_chains(config, molecule_data_dict, circles):
     """
@@ -1083,7 +1494,7 @@ def export_structure(chain_dict, mol_name_to_conformer, bonds_glyco,
     if peptide_data is not None:
         print("\n→ Using GLYCOPEPTIDE exporter")
         
-        final_no_h, enforced_atoms = saving_lps.export_complete_glycopeptide(
+        final_no_h, enforced_atoms, residue_index = saving_lps.export_complete_glycopeptide(
             chain_dict=chain_dict,
             conformers=conformers,
             mol_name_to_conformer=mol_name_to_conformer,
@@ -1096,12 +1507,15 @@ def export_structure(chain_dict, mol_name_to_conformer, bonds_glyco,
 
         print(f"\n✓ Exported glycopeptide: {name}_glycopeptide.sdf")
         print(f"Captured {enforced_atoms} enforced trans bonds before optimization")
-        return final_no_h, enforced_atoms
+        # CG the assembled (pre-optimization) structure, so the CG model reflects
+        # the geometry BEFORE the MD and can be compared against the optimized SDF.
+        export_cg_models(final_no_h, residue_index, f"{name}_{conformers_selection}")
+        return final_no_h, enforced_atoms, residue_index
     
     else:
         print("\n→ Using GLYCOLIPID exporter")
         
-        final_no_h = saving_lps.export_complete_structure_with_petn_and_lipids(
+        final_no_h, residue_index = saving_lps.export_complete_structure_with_petn_and_lipids(
             chain_dict,
             mol_name_to_conformer=mol_name_to_conformer,
             glycosidic_bonds=bonds_glyco,
@@ -1113,10 +1527,12 @@ def export_structure(chain_dict, mol_name_to_conformer, bonds_glyco,
             conformers=conformers,
             filename=f"{name}_{conformers_selection}"
         )
-        
+
         print(f"\n✓ Exported glycolipid: {name}_{conformers_selection}.sdf")
         print(f"  Atoms (no H): {final_no_h.GetNumAtoms()}")
-        return final_no_h
+        # CG the assembled (pre-optimization) structure (see glycopeptide branch).
+        export_cg_models(final_no_h, residue_index, f"{name}_{conformers_selection}")
+        return final_no_h, residue_index
 
 # ============================================================================
 # CONSTRAINT MANAGEMENT
@@ -1257,33 +1673,6 @@ def prepare_structure_for_optimization(final_no_h, name, conformers_selection):
     
     return final_with_h, pyranose_rings_no_h
 
-def setup_optimization_constraints(orientation_constraints, molecule_data_dict, 
-                                   final_no_h, pyranose_rings_no_h):
-    """
-    Setup ring constraints for optimization.
-    
-    Returns:
-        tuple: (fixed_atoms, reference_normals)
-    """
-    if not orientation_constraints:
-        print("\nNo orientation constraints - all rings free to move")
-        return None, None
-    
-    print("\nApplying orientation constraints...")
-    fixed_atoms_no_h, reference_normals, constrained_ring_ids = \
-        force_field_optimization.get_fixed_atoms_from_constraints_by_position(
-            orientation_constraints,
-            molecule_data_dict,
-            final_no_h,
-            pre_detected_rings=pyranose_rings_no_h
-        )
-    
-    # Atom indices preserved when H is added
-    fixed_atoms = fixed_atoms_no_h
-    print(f"  ✓ Constraining {len(constrained_ring_ids)} rings ({len(fixed_atoms)} atoms)")
-    
-    return fixed_atoms, reference_normals
-
 def check_and_fix_geometry(final_with_h):
     """Check and fix molecular geometry."""
     print("\nChecking molecular geometry...")
@@ -1299,7 +1688,8 @@ def check_and_fix_geometry(final_with_h):
 def run_optimization(final_with_h, fixed_atoms, reference_normals,
                     name, conformers_selection, molecule_data_dict, lipid_tail_indices,
                     stm_npy_path=None, pyranose_rings_no_h=None, initial_ring_coms=None,
-                    enable_phase1_kicks=False, torsion_constraints=None):
+                    enable_phase1_kicks=False, torsion_constraints=None,
+                    save_debug_checkpoints=False):
     """
     Run force field optimization using constants.
     
@@ -1362,7 +1752,8 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
         # Output
         save_images=False,  # Set to True for animation frames
         image_interval=constants.DEFAULT_IMAGE_INTERVAL,
-        output_name=f"{name}_{conformers_selection}_optimization"
+        output_name=f"{name}_{conformers_selection}_optimization",
+        save_debug_checkpoints=save_debug_checkpoints
     )
     
     print("\nConfiguration (from constants):")
@@ -1388,19 +1779,22 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
     
     return optimized_mol, success
 
-def save_optimization_results(final_with_h, optimized_mol, success, 
-                              name, conformers_selection):
+def save_optimization_results(final_with_h, optimized_mol, success,
+                              name, conformers_selection, residue_index=None,
+                              save_debug_checkpoints=False):
     """Save pre- and post-optimization structures."""
     print("\n" + "="*70)
     print("SAVING RESULTS")
     print("="*70)
-    
-    # Save pre-optimization  (disabled: only the final *_optimized.sdf is kept)
-    # utils.save_molecule(
-    #     final_with_h,
-    #     f"{name}_{conformers_selection}_pre_opt",
-    #     file_format='sdf'
-    # )
+
+    # Save pre-optimization (structure right after bonding, before any MD)
+    if save_debug_checkpoints:
+        utils.save_molecule(
+            final_with_h,
+            f"{name}_{conformers_selection}_pre_opt",
+            file_format='sdf'
+        )
+        print(f"  Saved: {name}_{conformers_selection}_pre_opt.sdf")
 
     # Save optimized
     if success:
@@ -1413,5 +1807,29 @@ def save_optimization_results(final_with_h, optimized_mol, success,
         filename = f'{name}_{conformers_selection}_partial'
         utils.save_molecule(optimized_mol, filename, file_format='sdf')
         print(f"\n⚠ Saved: {filename}.sdf")
-    
+
+    # Note: the coarse-grained models are written at export time from the
+    # PRE-optimization structure (see export_structure), not here.
+
     return success
+
+
+def export_cg_models(mol, residue_index, stem):
+    """Write the coarse-grained (Martini) debug models for ``mol``.
+
+    Called from export_structure on the assembled, PRE-optimization structure,
+    so the CG model reflects the geometry before the MD and can be diffed
+    against the optimized SDF.  Files use the ``<name>_<strategy>`` stem (no
+    ``_optimized`` suffix) so they are clearly the assembled model.  Any failure
+    here is non-fatal — the SDF is the primary artifact.
+    """
+    if not residue_index:
+        print("  (no residue map — skipping coarse-grained export)")
+        return
+    try:
+        from src.rotation_optimization.structure import cg_export
+        cg_export.export_cg_models(mol, residue_index, stem)
+    except Exception as exc:
+        import traceback
+        print(f"  ! coarse-grained export failed (SDF still saved): {exc}")
+        traceback.print_exc()

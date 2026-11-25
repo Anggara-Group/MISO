@@ -121,7 +121,166 @@ def parse_arguments():
         default=False,
         help="Enable stochastic kicks during phase 1 minimization to escape torsional local minima"
     )
+    parser.add_argument(
+        "--debug_checkpoints",
+        action="store_true",
+        default=False,
+        help="Save intermediate SDF structures (pre-opt, post-phase1, post-phase2 for atom "
+             "runs; pre-refine for sugar only rigid runs) next to the final structure"
+    )
+    parser.add_argument(
+        "--faces",
+        choices=["enumerate", "legacy"],
+        default="enumerate",
+        help="enumerate: each polymer is built in a different face state "
+             "(which face of every ring points up: 00, 01, 10, 11 for a dimer). "
+             "legacy: previous behaviour, polymers differ only by random fallback sampling."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for face state sampling and fallback rotations (default: 0)"
+    )
+    parser.add_argument(
+        "--duplicate_rmsd",
+        type=float,
+        default=0.25,
+        help="Assembled polymers closer than this RMSD (Angstrom) to an earlier "
+             "polymer are reported as duplicates (default: 0.25)"
+    )
+    parser.add_argument(
+        "--no_screen",
+        action="store_true",
+        help="Do not pre screen faces per sugar (try every face state)"
+    )
+    parser.add_argument(
+        "--no_joint_rotation",
+        action="store_true",
+        help="Skip the joint rotation of all sugars about their fixed COMs after assembly"
+    )
+    parser.add_argument(
+        "--max_gap",
+        type=float,
+        default=6.0,
+        help="Reject a face state if any linkage C...C stays above this after the joint "
+             "rotation (Angstrom, default: 6.0). A linkage the layout cannot close "
+             "(2.86 A is the strict limit) is accepted below this, built with a long "
+             "bond and reported as stretch; REFINE then shares the error between the "
+             "bond and the xy positions (see --k_xy)."
+    )
+    parser.add_argument(
+        "--pool_factor",
+        type=int,
+        default=4,
+        help="Face states kept in reserve per requested polymer, to replace rejected "
+             "states (default: 4)"
+    )
+    parser.add_argument(
+        "--refine",
+        choices=["rigid", "atom", "auto"],
+        default="rigid",
+        help="rigid (default): REFINE with rigid sugar beads (templates kept exactly, "
+             "glycosidic O rigid in its donor, xy at the experimental position, z free; "
+             "lipids, PEtN, phosphates and peptides free). atom: the previous atom level "
+             "MMFF minimisation and Langevin MD. auto: rigid whenever there are sugars, "
+             "atom when a peptide is present. A system without sugars has nothing to "
+             "keep rigid and always uses atom."
+    )
+    parser.add_argument(
+        "--r0_xy",
+        type=float,
+        default=0.5,
+        help="Rigid REFINE: free radius (Angstrom) of each sugar COM around its "
+             "experimental xy before the restraint acts (default: 0.5)"
+    )
+    parser.add_argument(
+        "--k_xy",
+        type=float,
+        default=50.0,
+        help="Rigid REFINE: stiffness (kcal/mol/A^2) of the xy restraint outside r0_xy "
+             "(default: 50). Decides where a too long linkage puts its error: low values "
+             "move the sugars off their circles and keep the bond short, high values keep "
+             "the circles and stretch the bond."
+    )
+    parser.add_argument(
+        "--gravity",
+        type=float,
+        default=None,
+        help="Rigid REFINE: gravity towards the surface (default: DEFAULT_GRAVITY from "
+             "src/constants.py, 2.0 unless the DEFAULT_GRAVITY environment variable is set)"
+    )
+    parser.add_argument(
+        "--compression_steps",
+        type=int,
+        default=None,
+        help="Rigid REFINE: number of press increments (default: DEFAULT_COMPRESSION_STEPS "
+             "from src/constants.py, 100 unless the environment variable is set). More "
+             "steps give a softer press."
+    )
+    parser.add_argument(
+        "--ceiling_margin",
+        type=float,
+        default=1.0,
+        help="Rigid REFINE: ceiling height above the thickest rigid sugar (Angstrom, default: 1.0)"
+    )
     args = parser.parse_args()
+    return args
+
+
+BUILD_OPTION_DEFAULTS = {
+    'faces': 'enumerate', 'seed': 0, 'duplicate_rmsd': 0.25, 'no_screen': False,
+    'no_joint_rotation': False, 'max_gap': 6.0, 'pool_factor': 4, 'refine': 'rigid',
+    'r0_xy': 0.5, 'k_xy': 50.0, 'ceiling_margin': 1.0,
+    'gravity': None, 'compression_steps': None,       # None: src/constants.py
+}
+
+
+def apply_build_options(args, config, argv=None):
+    """Let the yaml's ``build_options`` section override the parser defaults.
+
+    The parser carries the real defaults, so ``parse_arguments()`` alone gives
+    a complete, valid configuration (faces=enumerate, refine=rigid, ...).  A
+    value from the yaml replaces the default only for options that were not
+    typed on the command line; a typed flag always wins.  This lets a front
+    end that only writes the yaml set every build option, and keeps the
+    behaviour of any caller that never reads the yaml section.
+    """
+    import sys as _sys
+    argv = list(_sys.argv[1:] if argv is None else argv)
+    typed = {a.split('=', 1)[0].lstrip('-') for a in argv if a.startswith('--')}
+    opts = config.get('build_options') or {}
+    unknown = sorted(set(opts) - set(BUILD_OPTION_DEFAULTS))
+    if unknown:
+        print(f"  ! build_options: unknown keys ignored: {', '.join(unknown)}")
+    src = {}
+    for key, dflt in BUILD_OPTION_DEFAULTS.items():
+        if key in typed:
+            src[key] = 'cli'
+            continue
+        if key in opts:
+            val = opts[key]
+            if key == 'gravity':
+                val = None if val is None else float(val)
+            elif key == 'compression_steps':
+                val = None if val is None else int(val)
+            elif isinstance(dflt, bool):
+                val = bool(val)
+            elif isinstance(dflt, float):
+                val = float(val)
+            elif isinstance(dflt, int):
+                val = int(val)
+            setattr(args, key, val)
+            src[key] = 'yaml'
+        else:
+            src[key] = 'default'
+    if args.faces not in ('enumerate', 'legacy'):
+        raise ValueError(f"build_options.faces must be enumerate or legacy, got {args.faces!r}")
+    if args.refine not in ('rigid', 'atom', 'auto'):
+        raise ValueError(f"build_options.refine must be rigid, atom or auto, got {args.refine!r}")
+    print("\nBuild options: " + ", ".join(
+        f"{k}={getattr(args, k)}" + (f" ({src[k]})" if src[k] != 'default' else '')
+        for k in BUILD_OPTION_DEFAULTS))
     return args
 
 
@@ -140,6 +299,10 @@ def main():
     # ========================================================================
     args = parse_arguments()
     config = lpf.load_config(args.input_file)
+    args = apply_build_options(args, config)
+    if config.get('orientation_constraints'):
+        print("  ! orientation_constraints (flat / perpendicular) is no longer supported and is "
+              "ignored; set orientations with use_fixed_orientation + orientation_csv_path")
 
     # Extract configuration parameters
     sugars = config.get('sugars', {})
@@ -180,12 +343,21 @@ def main():
 
     if sugars:
         with timer.section("Phase 1: Monomer Building (shared)", level=0):
-            with timer.section("  Conformer generation", level=1):
-                conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
-            with timer.section("  Conformer analysis", level=1):
-                lpf.analyze_conformers(conformers)
-            with timer.section("  Monomer data extraction", level=1):
-                monomer_data = lpf.extract_monomer_data(conformers)
+            monomer_data_path = config.get('monomer_data_path')
+            if monomer_data_path:
+                # The GUI's monomer geometry: conformer generation is skipped, so the
+                # CSV orientations apply to exactly the conformers the GUI placed.
+                with timer.section("  Load monomer data (no conformer generation)", level=1):
+                    monomer_data, conformers = lpf.load_monomer_data(
+                        monomer_data_path, sugars, config['experimental_positions'],
+                        base_dir=os.path.dirname(os.path.abspath(args.input_file)))
+            else:
+                with timer.section("  Conformer generation", level=1):
+                    conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
+                with timer.section("  Conformer analysis", level=1):
+                    lpf.analyze_conformers(conformers)
+                with timer.section("  Monomer data extraction", level=1):
+                    monomer_data = lpf.extract_monomer_data(conformers)
             with timer.section("  Translation to experimental positions", level=1):
                 translated_conformers, carbon_vectors = lpf.translate_conformers_to_positions(
                     monomer_data, config['experimental_positions'], circles
@@ -195,6 +367,12 @@ def main():
                     translated_conformers, config['experimental_positions'],
                     conformers_selection, brightness
                 )
+            with timer.section("  User defined orientations", level=1):
+                # use_fixed_orientation + orientation_csv_path in the yaml: the
+                # listed sugars take the user's rotation instead of QUEST.
+                lpf.apply_defined_orientations(
+                    config, molecule_data_dict, translated_conformers,
+                    base_dir=os.path.dirname(os.path.abspath(args.input_file)))
             with timer.section("  Pickle molecule data", level=1):
                 output_file = f'{base_name}_molecule_data.pkl'
                 with open(output_file, 'wb') as f:
@@ -212,7 +390,58 @@ def main():
 
     all_polymer_results = []
 
-    for polymer_idx in range(1, args.n_polymers + 1):
+    # ------------------------------------------------------------------------
+    # Face states: one per polymer, so polymers differ structurally
+    # ------------------------------------------------------------------------
+    face_states = None
+    face_mol_order = []
+    assembled_coords = []          # (polymer_idx, label, coords) for duplicate checks
+    state_log = []                 # (label, status, polymer_idx, worst_gap, reason)
+    rigid_log = []                 # (polymer_idx, label, rigid REFINE report)
+    lipid_log = []                 # (polymer_idx, label, lipid info, before, after)
+    if sugars and args.faces == "enumerate":
+        face_mol_order, face_states, screening = lpf.plan_face_states(
+            molecule_data_dict, config, args.n_polymers, seed=args.seed,
+            pool_factor=args.pool_factor, screen=not args.no_screen)
+        print("\n" + "="*70)
+        print("FACE STATES")
+        print("="*70)
+        print(f"  Monomer order: {' '.join(face_mol_order)}   ('0' = face +1 up, '1' = face -1 up)")
+        if screening is not None:
+            n_valid = 1
+            for m in face_mol_order:
+                n_valid *= len(screening.get(m, {'valid': [1, -1]})['valid'])
+            print(f"  Face pre screen: {n_valid} of {2 ** len(face_mol_order)} states possible")
+            for m in face_mol_order:
+                sc = screening.get(m)
+                if sc and sc['note'] in ('face fixed by layout', 'neither face fits'):
+                    face = ''.join('0' if f == 1 else '1' for f in sc['valid'])
+                    print(f"    {m}: {sc['note']} (allowed {face}; slack face0 "
+                          f"{sc['slack'][1]:+.2f} A, face1 {sc['slack'][-1]:+.2f} A)")
+            far = [m for m in face_mol_order
+                   if screening.get(m, {}).get('note') == 'neither face fits']
+            if far:
+                print(f"  ! Layout check: {', '.join(far)} cannot close a linkage in either face "
+                      f"(the circles are further apart than the rigid templates reach by the "
+                      f"slack above). Such linkages are built with a long bond, accepted up to "
+                      f"max_gap = {args.max_gap:.1f} A C...C, and reported as stretch; REFINE then "
+                      f"shares the error between the bond and the xy positions (k_xy).")
+        if len(face_states) < args.n_polymers:
+            print(f"  Only {len(face_states)} possible face states; "
+                  f"generating at most {len(face_states)} polymers instead of {args.n_polymers}")
+            args.n_polymers = len(face_states)
+        print(f"  {len(face_states)} states queued for {args.n_polymers} polymers")
+
+    attempts = face_states if face_states else [None] * args.n_polymers
+    n_accepted = 0
+
+    for face_state in attempts:
+        if n_accepted >= args.n_polymers:
+            break
+        polymer_idx = n_accepted + 1
+        counted = face_state is None       # legacy polymers always use their slot
+        if counted:
+            n_accepted += 1
 
         print("\n" + "#"*70)
         print(f"# POLYMER {polymer_idx}/{args.n_polymers}")
@@ -220,6 +449,8 @@ def main():
 
         name = f"{base_name}_p{polymer_idx}"
         tag = f"P{polymer_idx}"
+        face_label = (lpf.building_chain.face_state_label(face_state, face_mol_order)
+                      if face_state is not None else '')
 
         try:
             with timer.section(f"{tag} total", level=1):
@@ -235,9 +466,42 @@ def main():
                 with timer.section(f"{tag} Phase 2: Structure Assembly", level=2):
                     if sugars:
                         with timer.section(f"{tag}   Chain building (rotation/alignment)", level=3):
-                            chain_dict, bonds_glyco, sorted_linkages = lpf.build_glycan_chain(
-                                molecule_data_dict, config, args.iterations
+                            chain_dict, bonds_glyco, sorted_linkages, joint_report = lpf.build_glycan_chain(
+                                molecule_data_dict, config, args.iterations,
+                                face_state=face_state,
+                                seed=args.seed * 1000 + len(state_log) + 1,
+                                joint_rotation=not args.no_joint_rotation,
+                                max_gap=args.max_gap,
+                                return_report=True
                             )
+                            if face_state is not None:
+                                label = lpf.building_chain.face_state_label(face_state, face_mol_order)
+                                if joint_report is not None and not joint_report['valid']:
+                                    print(f"\n  Face state {label} REJECTED: {joint_report['reason']}"
+                                          f" -- trying the next state")
+                                    state_log.append((label, 'rejected', '', joint_report['worst_gap'],
+                                                      joint_report['reason']))
+                                    continue
+                                state_log.append((label, 'accepted', polymer_idx,
+                                                  joint_report['worst_gap'] if joint_report else '',
+                                                  'ok'))
+                                n_accepted += 1
+                                counted = True
+                                got = {m: lpf.building_chain.face_sign(chain_dict[m])
+                                       for m in face_mol_order if m in chain_dict}
+                                got_label = ''.join('1' if got.get(m, 1) == -1 else '0'
+                                                    for m in face_mol_order)
+                                print(f"\n  Face state requested {label}, assembled {got_label}"
+                                      + ("" if got_label == label else "   <-- MISMATCH"))
+                                coords = lpf.chain_coordinates(chain_dict, face_mol_order)
+                                for prev_idx, prev_label, prev in assembled_coords:
+                                    if prev.shape == coords.shape:
+                                        rmsd = float(np.sqrt(((prev - coords) ** 2).sum(axis=1).mean()))
+                                        if rmsd < args.duplicate_rmsd:
+                                            print(f"  WARNING: polymer {polymer_idx} ({label}) is within "
+                                                  f"{rmsd:.2f} A of polymer {prev_idx} ({prev_label}): "
+                                                  f"near duplicate")
+                                assembled_coords.append((polymer_idx, label, coords))
                         with timer.section(f"{tag}   Phosphate linkages", level=3):
                             phosphate_bonds_with_names, unbonded_monomers = lpf.add_phosphate_linkages(
                                 config, molecule_data_dict, chain_dict
@@ -245,7 +509,9 @@ def main():
                         with timer.section(f"{tag}   PEtN modifications", level=3):
                             petn_linkages = lpf.add_petn_modifications(config, chain_dict, circles)
                         with timer.section(f"{tag}   Lipid chain building", level=3):
-                            all_lipids = lpf.add_lipid_chains(config, molecule_data_dict, circles)
+                            all_lipids = lpf.add_lipid_chains(
+                                config, lpf.lipid_source_dict(molecule_data_dict, chain_dict,
+                                                              unbonded_monomers), circles)
                     else:
                         chain_dict = {}
                         bonds_glyco = []
@@ -276,7 +542,7 @@ def main():
                     with timer.section(f"{tag}   Structure export (SDF)", level=3):
                         if sugars:
                             if peptide_data is not None:
-                                final_no_h, enforced_atoms = lpf.export_structure(
+                                final_no_h, enforced_atoms, residue_index = lpf.export_structure(
                                     chain_dict, mol_name_to_conformer, bonds_glyco,
                                     [tuple(link) for link in config.get('glycosidic_bonds', [])],
                                     phosphate_bonds_with_names, petn_linkages, all_lipids,
@@ -284,7 +550,7 @@ def main():
                                     name, conformers_selection
                                 )
                             else:
-                                final_no_h = lpf.export_structure(
+                                final_no_h, residue_index = lpf.export_structure(
                                     chain_dict, mol_name_to_conformer, bonds_glyco,
                                     [tuple(link) for link in config.get('glycosidic_bonds', [])],
                                     phosphate_bonds_with_names, petn_linkages, all_lipids,
@@ -297,6 +563,7 @@ def main():
                             from rdkit import Chem
                             final_no_h = peptide_data['rdkit_mol']
                             enforced_atoms = []
+                            residue_index = None
                             Chem.MolToPDBFile(final_no_h, f"{name}_cyclic_peptide.pdb")
                             print(f"  Saved: {name}_cyclic_peptide.pdb")
 
@@ -341,32 +608,90 @@ def main():
                             fixed_atoms = list(set(fixed_atoms + petn_n_indices))
                         reference_normals = None
 
-                    with timer.section(f"{tag}   Geometry check/fix", level=3):
-                        final_with_h = lpf.check_and_fix_geometry(final_with_h)
+                    refine_mode = args.refine
+                    if refine_mode == "auto":
+                        # Rigid whenever there are sugars; a peptide goes to the atom
+                        # level path (linker rings frozen, trans amide restraints).
+                        refine_mode = "rigid" if (sugars and peptide_data is None) else "atom"
+                        if sugars and peptide_data is not None:
+                            print("  (auto: peptide present, atom level REFINE)")
+                    if refine_mode == "rigid" and not sugars:
+                        # Nothing to keep rigid (pure peptide): the rigid engine would
+                        # find no bead.
+                        print("  (no sugars in this system: atom level REFINE)")
+                        refine_mode = "atom"
+                    elif refine_mode == "rigid" and peptide_data is not None:
+                        print("  (rigid REFINE with a peptide: peptide atoms are free "
+                              "particles, linker ring atoms stay fixed; not yet validated "
+                              "on a glycopeptide)")
+                    print(f"\n  REFINE mode: {refine_mode}")
 
-                    with timer.section(f"{tag}   Ring COM extraction", level=3):
-                        initial_ring_coms = lpf.extract_initial_ring_coms_from_monomers(
-                            molecule_data_dict,
-                            final_no_h,
-                            pyranose_rings_no_h
-                        )
+                    if refine_mode == "rigid":
+                        # No check_and_fix_geometry here: fix_overlapping_atoms moves
+                        # atoms, and the rigid path must start from the templates.
+                        if args.debug_checkpoints:
+                            from src.rotation_optimization.md.utils import save_molecule
+                            save_molecule(final_with_h,
+                                          f"{name}_{conformers_selection}_pre_refine",
+                                          file_format='sdf')
+                            print(f"  Saved: {name}_{conformers_selection}_pre_refine.sdf")
+                        with timer.section(f"{tag}   Rigid body REFINE", level=3):
+                            from src.rotation_optimization.rigid_refine import (
+                                refine_structure, RigidRefineConfig)
+                            rigid_kw = {}
+                            if args.gravity is not None:
+                                rigid_kw['gravity'] = args.gravity
+                            if args.compression_steps is not None:
+                                rigid_kw['compression_steps'] = args.compression_steps
+                            rigid_cfg = RigidRefineConfig(
+                                r0_xy=args.r0_xy, k_xy=args.k_xy,
+                                ceiling_margin=args.ceiling_margin, **rigid_kw)
+                            optimized_mol, rigid_report = refine_structure(
+                                final_with_h, final_no_h, chain_dict,
+                                [tuple(link) for link in config.get('glycosidic_bonds', [])],
+                                fixed_atoms=fixed_atoms, config=rigid_cfg,
+                                pins=lpf.lipid_pins(final_with_h, all_lipids))
+                            success = (rigid_report['max_rigid_rmsd'] < 1e-6
+                                       and rigid_report['faces_kept'])
+                            rigid_log.append((polymer_idx, face_label, rigid_report))
+                    else:
+                        with timer.section(f"{tag}   Geometry check/fix", level=3):
+                            final_with_h = lpf.check_and_fix_geometry(final_with_h)
 
-                    with timer.section(f"{tag}   Force field optimization (total)", level=3):
-                        optimized_mol, success = lpf.run_optimization(
-                            final_with_h, fixed_atoms, reference_normals,
-                            name, conformers_selection, molecule_data_dict,
-                            lipid_tail_indices,
-                            pyranose_rings_no_h=pyranose_rings_no_h,
-                            initial_ring_coms=initial_ring_coms,
-                            stm_npy_path=stm_npz_path,
-                            enable_phase1_kicks=args.phase1_kicks,
-                            torsion_constraints=torsion_constraints
-                        )
+                        with timer.section(f"{tag}   Ring COM extraction", level=3):
+                            initial_ring_coms = lpf.extract_initial_ring_coms_from_monomers(
+                                molecule_data_dict,
+                                final_no_h,
+                                pyranose_rings_no_h
+                            )
+
+                        with timer.section(f"{tag}   Force field optimization (total)", level=3):
+                            optimized_mol, success = lpf.run_optimization(
+                                final_with_h, fixed_atoms, reference_normals,
+                                name, conformers_selection, molecule_data_dict,
+                                lipid_tail_indices,
+                                pyranose_rings_no_h=pyranose_rings_no_h,
+                                initial_ring_coms=initial_ring_coms,
+                                stm_npy_path=stm_npz_path,
+                                enable_phase1_kicks=args.phase1_kicks,
+                                torsion_constraints=torsion_constraints,
+                                save_debug_checkpoints=args.debug_checkpoints
+                            )
+
+                    if all_lipids:
+                        for info in lpf.lipid_atoms(final_with_h, all_lipids):
+                            after = (lpf.lipid_geometry(optimized_mol, info)
+                                     if optimized_mol is not None
+                                     and optimized_mol.GetNumAtoms() == final_with_h.GetNumAtoms()
+                                     else None)
+                            lipid_log.append((polymer_idx, face_label, info,
+                                              lpf.lipid_geometry(final_with_h, info), after))
 
                     with timer.section(f"{tag}   Save results", level=3):
                         lpf.save_optimization_results(
                             final_with_h, optimized_mol, success,
-                            name, conformers_selection
+                            name, conformers_selection, residue_index,
+                            save_debug_checkpoints=args.debug_checkpoints
                         )
 
             # Store results
@@ -382,6 +707,8 @@ def main():
             print(f"\n✓ Polymer {polymer_idx} complete: {'SUCCESS' if success else 'PARTIAL'}")
 
         except Exception as e:
+            if not counted:                # a crashed build still uses its slot
+                n_accepted += 1
             print(f"\n✗ ERROR in Polymer {polymer_idx}: {e}")
             import traceback
             traceback.print_exc()
@@ -392,6 +719,73 @@ def main():
                 'success': False,
                 'error': str(e)
             })
+
+    if lipid_log:
+        path = f"{base_name}_lipids.csv"
+        keys = ('anchor_bond', 'cc_min', 'cc_max', 'ccc_min', 'ccc_max',
+                'z_min', 'z_max', 'tail_z_spread', 'mid_off', 'tip_off')
+        fmt = lambda v: '' if v is None else f"{v:.3f}"
+        with open(path, "w") as fh:
+            fh.write("polymer,face_state,lipid,linkage,branched,n_requested,n_used,"
+                     + ",".join(f"{k}_built" for k in keys) + ","
+                     + ",".join(f"{k}_refined" for k in keys) + "\n")
+            for pidx, label, info, before, after in lipid_log:
+                fh.write(f"{pidx},{label},\"{info['label']}\",{info['linkage']},"
+                         f"{int(info['branched'])},{info['n_requested'] or 'auto'},{info['n_used']},"
+                         + ",".join(fmt(before[k]) for k in keys) + ","
+                         + ",".join(fmt(after[k] if after else None) for k in keys) + "\n")
+        print(f"\nLipid geometry (built and after REFINE) -> {path}")
+        for pidx, label, info, before, after in lipid_log:
+            g = after or before
+            pts = " ".join(f"{w} {g[k]:.2f} A" for w, k in (('mid', 'mid_off'), ('tip', 'tip_off'))
+                           if g[k] is not None)
+            print(f"  polymer {pidx} {info['label']}: carbons {info['n_used']} "
+                  f"(asked {info['n_requested'] or 'auto'}), bond {g['anchor_bond']:.2f} A, "
+                  f"C-C {g['cc_min']:.2f}..{g['cc_max']:.2f} A, C-C-C "
+                  f"{g['ccc_min']:.0f}..{g['ccc_max']:.0f} deg, tail z spread "
+                  f"{g['tail_z_spread']:.2f} A, off point: {pts}")
+
+    if rigid_log:
+        path = f"{base_name}_rigid_refine.csv"
+        with open(path, "w") as fh:
+            fh.write("polymer,face_state,rigid_ok,faces_kept,mmff_energy_kcal,mmff_energy_before,"
+                     "worst_linkage_stretch_A,max_xy_drift_A,thickness_A,seconds\n")
+            for pidx, label, rep in rigid_log:
+                stretch = max((r['stretch'] for r in rep['linkages']), default=0.0)
+                drift = max((r['xy_drift'] for r in rep['beads']), default=0.0)
+                fh.write(f"{pidx},{label},{int(rep['max_rigid_rmsd'] < 1e-6)},"
+                         f"{int(rep['faces_kept'])},{rep['energy_mmff']:.2f},"
+                         f"{rep['energy_mmff_before']:.2f},{stretch:.3f},{drift:.3f},"
+                         f"{max(rep['thickness']):.2f},{rep['run']['seconds']:.1f}\n")
+        state_path = f"{base_name}_rigid_state.csv"
+        with open(state_path, "w") as fh:
+            fh.write("polymer,face_state,bead,com_x,com_y,com_z,qx,qy,qz,qw,"
+                     "refine_qx,refine_qy,refine_qz,refine_qw\n")
+            for pidx, label, rep in rigid_log:
+                for r in rep.get('state', []):
+                    c, q, rq = r['com'], r['quaternion'], r['refine_quaternion']
+                    fh.write(f"{pidx},{label},{r['bead']},{c[0]:.4f},{c[1]:.4f},{c[2]:.4f},"
+                             f"{q[0]:.6f},{q[1]:.6f},{q[2]:.6f},{q[3]:.6f},"
+                             f"{rq[0]:.6f},{rq[1]:.6f},{rq[2]:.6f},{rq[3]:.6f}\n")
+        print(f"\nRigid REFINE summary -> {path}")
+        print(f"Rigid body state (COM + quaternion per sugar) -> {state_path}")
+        for pidx, label, rep in rigid_log:
+            print(f"  polymer {pidx} {label}: MMFF {rep['energy_mmff']:.1f} kcal/mol, "
+                  f"faces kept {rep['faces_kept']}, worst stretch "
+                  f"{max((r['stretch'] for r in rep['linkages']), default=0.0):+.3f} A")
+
+    if state_log:
+        with open(f"{base_name}_face_states.csv", "w") as fh:
+            fh.write("try,label,status,polymer,worst_linkage_CC_A,reason\n")
+            for i, (label, status, pidx, gap, reason) in enumerate(state_log, 1):
+                gap_s = f"{gap:.3f}" if isinstance(gap, float) else gap
+                fh.write(f"{i},{label},{status},{pidx},{gap_s},{reason}\n")
+        n_rej = sum(1 for r in state_log if r[1] == 'rejected')
+        print(f"\nFace states: {len(state_log) - n_rej} accepted, {n_rej} rejected "
+              f"-> {base_name}_face_states.csv")
+        if n_accepted < args.n_polymers:
+            print(f"  WARNING: only {n_accepted} of {args.n_polymers} requested polymers found a "
+                  f"valid face state (raise --pool_factor or check the layout)")
 
     # ========================================================================
     # SUMMARY
