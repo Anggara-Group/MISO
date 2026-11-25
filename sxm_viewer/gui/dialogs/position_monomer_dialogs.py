@@ -1,0 +1,1463 @@
+from __future__ import annotations
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from ..._shared import QtCore, QtWidgets
+from ...utils.sugar_lookup import (
+    SugarConnectionError, SugarLookupError, lookup_sugar, parse_sugar_description,
+)
+from ...utils.miso_yaml import MISOExportError, build_miso_config
+from ._sxm_image_loader import load_demo_image
+from ._miso_connection_panel import MISOConnectionMixin
+from ._canvas_zoom import CanvasZoom, zoom_buttons
+from ._lipid_picker import (  # noqa: F401  (re-exported for callers and tests)
+    LipidPickerMixin, import_lipid_engine, LINKAGES, _HEADGROUP_LAYOUT, _elem_from_key)
+
+
+# The engine filters base labels; specific chairs are filtered locally afterward.
+RING_TYPES = ["Any", "chair", "chair_4C1", "chair_1C4", "boat", "twist", "envelope", "half"]
+ANOMERS = ["Any", "alpha", "beta"]
+
+
+class _SugarLookupSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object, str, str)
+
+
+class _SugarLookupWorker(QtCore.QRunnable):
+    def __init__(self, requests):
+        super().__init__()
+        self.requests = requests
+        self.signals = _SugarLookupSignals()
+
+    def run(self):
+        results = []
+        cache = {}
+        for row, request in self.requests:
+            try:
+                if request.query not in cache:
+                    cache[request.query] = lookup_sugar(request.query)
+                results.append((row, request, cache[request.query]))
+            except SugarConnectionError as exc:
+                self.signals.finished.emit([], "No internet connection", str(exc))
+                return
+            except SugarLookupError as exc:
+                self.signals.finished.emit([], "Sugar lookup", f"Row {row+1}: {exc}")
+                return
+        self.signals.finished.emit(results, "", "")
+
+# Amino-acid tables mirrored from MISO peptide_building.build_peptide_with_rdkit_ca
+# (those dicts are function-local there, so we replicate the standard 20 here).
+AA_MAP = {'A': 'Ala', 'R': 'Arg', 'N': 'Asn', 'D': 'Asp', 'C': 'Cys',
+          'E': 'Glu', 'Q': 'Gln', 'G': 'Gly', 'H': 'His', 'I': 'Ile',
+          'L': 'Leu', 'K': 'Lys', 'M': 'Met', 'F': 'Phe', 'P': 'Pro',
+          'S': 'Ser', 'T': 'Thr', 'W': 'Trp', 'Y': 'Tyr', 'V': 'Val'}
+AA_SMILES = {
+    'Ala': 'N[C@@H](C)C(=O)O',
+    'Val': 'N[C@@H](C(C)C)C(=O)O',
+    'Leu': 'N[C@@H](CC(C)C)C(=O)O',
+    'Ile': 'N[C@@H]([C@H](CC)C)C(=O)O',
+    'Met': 'N[C@@H](CCSC)C(=O)O',
+    'Phe': 'N[C@@H](Cc1ccccc1)C(=O)O',
+    'Trp': 'N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O',
+    'Pro': 'N1[C@@H](CCC1)C(=O)O',
+    'Ser': 'N[C@@H](CO)C(=O)O',
+    'Thr': 'N[C@@H]([C@H](O)C)C(=O)O',
+    'Tyr': 'N[C@@H](Cc1ccc(O)cc1)C(=O)O',
+    'Cys': 'N[C@@H](CS)C(=O)O',
+    'Asn': 'N[C@@H](CC(=O)N)C(=O)O',
+    'Gln': 'N[C@@H](CCC(=O)N)C(=O)O',
+    'Asp': 'N[C@@H](CC(=O)O)C(=O)O',
+    'Glu': 'N[C@@H](CCC(=O)O)C(=O)O',
+    'Lys': 'N[C@@H](CCCCN)C(=O)O',
+    'Arg': 'N[C@@H](CCCNC(=N)N)C(=O)O',
+    'His': 'N[C@@H](Cc1c[nH]cn1)C(=O)O',
+    'Gly': 'NCC(=O)O',
+}
+
+
+def resolve_aa(code):
+    """Map a 1- or 3-letter residue code to (canonical_name, smiles).
+
+    Accepts 'N', 'Asn', 'ASN' (case-insensitive on 3-letter). Returns
+    (None, None) when the code is not one of the standard 20.
+    """
+    code = (code or "").strip()
+    if not code:
+        return None, None
+    if len(code) == 1:
+        name = AA_MAP.get(code.upper())
+    else:
+        name = code.title()
+        if name not in AA_SMILES:
+            name = None
+    if name is None:
+        return None, None
+    return name, AA_SMILES[name]
+
+
+# Side-chain functional-group type per residue, mirrored from MISO
+# peptide_building.AA_FUNCTIONAL_GROUPS. Used to auto-locate the functional
+# point instead of requiring a manual click; residues mapped to None have no
+# side-chain functional group (functional_position stays unset for them).
+AA_FUNCTIONAL_GROUPS = {
+    'Ala': None, 'Val': None, 'Leu': None, 'Ile': None, 'Met': None, 'Gly': None,
+    'Pro': 'ring_centroid', 'Phe': 'ring_centroid', 'Trp': 'ring_centroid', 'His': 'ring_centroid',
+    'Ser': 'hydroxyl_o', 'Thr': 'hydroxyl_o', 'Tyr': 'hydroxyl_o',
+    'Cys': 'thiol_s',
+    'Asn': 'amide_n', 'Gln': 'amide_n',
+    'Asp': 'carboxyl_c', 'Glu': 'carboxyl_c',
+    'Lys': 'amine_n',
+    # 'Arg': 'guanidinium_c' has no matching finder in MISO peptide_building
+    # either (find_functional_group_atom has no branch for it), so it is
+    # left out here too rather than silently returning a wrong atom.
+}
+
+
+def _find_functional_group_atom(mol, functional_type):
+    """Locate the side-chain functional-group atom on an explicit-H RDKit
+    mol, mirroring MISO peptide_building.find_functional_group_atom exactly
+    (same heuristics, same SMILES source, so atom order matches). Returns an
+    atom index, or None if not found.
+    """
+    from rdkit import Chem
+
+    if functional_type == 'hydroxyl_o':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'O':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'H' in neighbors and 'C' in neighbors:
+                    return atom.GetIdx()
+
+    elif functional_type == 'amide_n':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'N':
+                for n in atom.GetNeighbors():
+                    if n.GetSymbol() != 'C':
+                        continue
+                    has_double_o = any(
+                        nn.GetSymbol() == 'O' and
+                        mol.GetBondBetweenAtoms(n.GetIdx(), nn.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
+                        for nn in n.GetNeighbors()
+                    )
+                    if has_double_o:
+                        h_count = sum(1 for nn in atom.GetNeighbors() if nn.GetSymbol() == 'H')
+                        if h_count >= 1:
+                            return atom.GetIdx()
+
+    elif functional_type == 'thiol_s':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'S':
+                return atom.GetIdx()
+
+    elif functional_type == 'carboxyl_c':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'C':
+                neighbors = list(atom.GetNeighbors())
+                o_count = sum(1 for n in neighbors if n.GetSymbol() == 'O')
+                if o_count == 2 and not any(n.GetSymbol() == 'N' for n in neighbors):
+                    return atom.GetIdx()
+
+    elif functional_type == 'amine_n':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'N':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if neighbors.count('H') >= 2 and 'C' in neighbors:
+                    return atom.GetIdx()
+
+    return None
+
+
+def _find_functional_atom_indices(mol_with_h, aa_name):
+    """Atom indices (in mol_with_h) whose centroid is the side-chain
+    functional point for aa_name, or None if the residue has no side-chain
+    functional group or it could not be located.
+    """
+    functional_type = AA_FUNCTIONAL_GROUPS.get(aa_name)
+    if functional_type is None:
+        return None
+    if functional_type == 'ring_centroid':
+        rings = mol_with_h.GetRingInfo().AtomRings()
+        if not rings:
+            return None
+        return list(max(rings, key=len))
+    idx = _find_functional_group_atom(mol_with_h, functional_type)
+    return [idx] if idx is not None else None
+
+
+def _find_ca_atom(mol, aa_name):
+    """Locate the Cα atom, mirroring MISO peptide_building.find_ca_in_aa
+    (same heuristics, same SMILES source, so atom order matches). Returns
+    an atom index, or None if not found.
+    """
+    from rdkit import Chem
+    if aa_name == 'Gly':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'C':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'N' in neighbors and neighbors.count('C') == 1:
+                    return atom.GetIdx()
+        return None
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() == 'C' and atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+            return atom.GetIdx()
+    return None
+
+# Element colors for the 2D overlay (top-down projection onto the STM image).
+ATOM_COLORS = {"C": "#222222", "O": "#e53935", "N": "#1e88e5",
+               "H": "#bbbbbb", "S": "#fdd835", "P": "#fb8c00"}
+ATOM_SIZE = {"C": 26, "O": 24, "N": 24, "H": 8, "S": 30, "P": 30}
+
+
+# --------------------------------------------------------------------------- math
+def euler_to_matrix(rx, ry, rz):
+    """Rotation matrix for extrinsic X→Y→Z rotations (degrees). R = Rz@Ry@Rx."""
+    rx, ry, rz = np.radians([rx, ry, rz])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def matrix_to_quaternion(m):
+    """Rotation matrix -> quaternion (x, y, z, w), scipy/MISO ordering."""
+    t = np.trace(m)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    return np.array([x, y, z, w])
+
+
+def import_monomer_engine():
+    """Import MISO's monomer_building module (adds it to sys.path once)."""
+    repo = Path(__file__).resolve().parents[3]
+    mb_dir = repo / "MISO" / "src" / "monomer_building"
+    if not (mb_dir / "monomer_building.py").exists():
+        raise ImportError(f"monomer_building.py not found under {mb_dir}")
+    if str(mb_dir) not in sys.path:
+        sys.path.insert(0, str(mb_dir))
+    import monomer_building  # noqa: E402
+    return monomer_building
+
+
+def build_sugar_template(engine, smiles, ring, anom):
+    """Lowest-energy MISO conformer matching ring/anomer, plus its exact rigid data."""
+    known_ring = None if ring == "Any" else ring.split("_")[0]
+    known_anom = None if anom == "Any" else anom
+    try:
+        confs = engine.generate_monomer_conformers(
+            smiles, known_ring_type=known_ring, known_anomer=known_anom)
+    except Exception as exc:
+        print(f"generate_monomer_conformers failed for {smiles}: {exc}")
+        return None
+    if not confs:
+        return None
+    if ring.startswith("chair_"):
+        confs = {name: data for name, data in confs.items()
+                 if data["puckering_type"] == ring}
+        if not confs:
+            print(f"No generated conformer matches the requested {ring}.")
+            return None
+    # Conformers are returned lowest-energy first (rank1).
+    conf_name = next(iter(confs))
+    data = confs[conf_name]
+    coords = np.asarray(data["coordinates"], dtype=float)
+    com = np.asarray(data["COM"], dtype=float)
+    atom_types = list(data["atom_types"])
+    bonds = []
+    mol = data.get("molecule")
+    if mol is not None:
+        for b in mol.GetBonds():
+            bonds.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+    # Capture the EXACT rigid monomer data MISO would otherwise regenerate
+    # (relative_coordinates, atom_types, carbon_map, oh_map, anomer,
+    # anomeric_oxygen_idx, quaternion) for this single chosen conformer, so a
+    # fixed-orientation run reuses this geometry instead of re-embedding.
+    rigid = None
+    try:
+        rigid = engine.extract_rigid_monomer_data({conf_name: data})
+    except Exception as exc:
+        print(f"extract_rigid_monomer_data failed for {smiles}: {exc}")
+    return {"conf_name": conf_name, "rel": coords - com,
+            "atom_types": atom_types, "bonds": bonds, "rigid": rigid}
+
+
+def build_aa_template(smiles, name):
+    """Single lowest-energy conformer for an amino acid (embed + MMFF).
+
+    The anchor (COM) is the C-alpha atom, because MISO places and rotates each
+    residue by treating the picked point as the C-alpha. Shared by the Position
+    monomers and Position coordinates dialogs. Returns None on failure.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            return None
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+        except Exception:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+        # Locate the side-chain functional group (e.g. the ring in Phe) and the
+        # C-alpha on the explicit-H mol before RemoveHs strips the hydrogens.
+        functional_atom_indices = _find_functional_atom_indices(mol, name)
+        ca_atom_index = _find_ca_atom(mol, name)
+        if ca_atom_index is None:
+            print(f"amino-acid build warning for {name}: Calpha not found, "
+                  f"falling back to whole-residue mass centroid as anchor")
+        return PositionMonomerDialog._template_from_mol(
+            mol, name, functional_atom_indices, ca_atom_index)
+    except Exception as exc:
+        print(f"amino-acid build failed for {name} ({smiles}): {exc}")
+        return None
+
+
+class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDialog):
+    """Build MISO monomers from SMILES or sugar names and place them on the STM image.
+
+    Workflow:
+      1. Fill the table: SMILES or sugar description, ring type (chair/boat/...),
+         anomer (alpha/beta) and number of copies for each monomer. Sugar names
+         are resolved online before building; manual SMILES works offline.
+      2. *Build monomers* runs monomer_building.generate_monomer_conformers with
+         the chosen puckering/anomer filter and keeps the lowest-energy match,
+         then instantiates the requested copies.
+      3. Select an instance, click *Place* to drop its centre on the image, and
+         use RX/RY/RZ to rotate it in 3D (projected top-down onto the image).
+         With the subunit list or image focused, arrow keys nudge it in X/Y
+         (Shift for larger steps).
+      4. *Export CSV + MISO input YAML* writes the COM (Angstrom) plus the placement rotation
+         matrix and quaternion for every instance, for downstream MISO analysis.
+    """
+
+    NUDGE_STEP_ANG = 0.5
+    NUDGE_FAST_FACTOR = 5
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent or viewer)
+        self.viewer = viewer
+        self.setWindowTitle("Position monomer")
+        self.setMinimumSize(1080, 700)
+        self.resize(1200, 780)
+
+        self._updating = False
+        self._place_cid = None
+        self._func_cid = None     # canvas pick for amino-acid functional point
+        self._templates = {}      # row index -> template dict
+        self._instances = []      # list of instance dicts
+        self._connections = []
+        self._overlay_artists = []
+        self._lookup_worker = None
+        self._lookup_cancelled = False
+        self.finished.connect(self._cancel_sugar_lookup)
+
+        # Lipids: point defined chains (shared builder in _lipid_picker).
+        self._init_lipid_state()
+
+        loaded = load_demo_image(viewer)
+        self._img = loaded["img"]
+        self._px = loaded["px"]
+        self._scan_dir = loaded["scan_dir"]
+        self._sxm_path = loaded["sxm_path"]
+        self._load_error = loaded["error"]
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        # Two columns: image on the left, all controls on the right (scrollable)
+        # so the growing set of tools never overflows the dialog.
+        root = QtWidgets.QHBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        loaded = self._img is not None
+        if loaded:
+            info = (f"{self._sxm_path.name}  |  {self._img.shape[1]}×{self._img.shape[0]} px"
+                    f"  |  {self._px[0]*10:.3f} Å/px  |  scan_dir={self._scan_dir or '?'}")
+        else:
+            info = f"⚠ Image not loaded: {self._load_error}"
+
+        # ---- left column: info + canvas ----
+        left = QtWidgets.QVBoxLayout()
+        self.info_lbl = QtWidgets.QLabel(info)
+        self.info_lbl.setWordWrap(True)
+        left.addWidget(self.info_lbl)
+        if loaded:
+            self._build_canvas(left)
+        else:
+            left.addStretch()
+        root.addLayout(left, stretch=3)
+
+        # ---- right column: controls inside a scroll area ----
+        panel = QtWidgets.QWidget()
+        col = QtWidgets.QVBoxLayout(panel)
+        col.setSpacing(8)
+        col.setContentsMargins(0, 0, 0, 0)
+
+        # --- include options ---
+        opt_row = QtWidgets.QHBoxLayout()
+        opt_row.addWidget(QtWidgets.QLabel("Sugars always available."))
+        self.aa_chk = QtWidgets.QCheckBox("Include amino acids")
+        self.aa_chk.toggled.connect(self._on_include_aa_toggled)
+        opt_row.addWidget(self.aa_chk)
+        self.lipid_chk = QtWidgets.QCheckBox("Include lipids")
+        self.lipid_chk.setEnabled(loaded)
+        self.lipid_chk.toggled.connect(self._on_include_lipids_toggled)
+        opt_row.addWidget(self.lipid_chk)
+        opt_row.addStretch()
+        col.addLayout(opt_row)
+
+        # --- subunit table (sugars + amino acids can be mixed) ---
+        col.addWidget(QtWidgets.QLabel(
+            "Subunits to build (mix for glycopeptides):"))
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Type", "Name", "SMILES / Sugar name / Residue", "Ring type", "Anomer", "Copies"])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        for c in (0, 1, 3, 4, 5):
+            hdr.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.setFixedHeight(150)
+        col.addWidget(self.table)
+        self.lookup_status = QtWidgets.QLabel(
+            "Sugar input: SMILES or a name, e.g. chair KDO / D chair 4C1 glucose. "
+            "Build looks up names online; manual SMILES works offline.")
+        self.lookup_status.setWordWrap(True)
+        col.addWidget(self.lookup_status)
+
+        def_row = QtWidgets.QHBoxLayout()
+        self.add_sugar_btn = QtWidgets.QPushButton("Add sugar")
+        self.add_sugar_btn.clicked.connect(lambda: self._add_table_row("Sugar"))
+        self.add_aa_btn = QtWidgets.QPushButton("Add amino acid")
+        self.add_aa_btn.setEnabled(False)
+        self.add_aa_btn.clicked.connect(lambda: self._add_table_row("Amino acid"))
+        self.del_btn = QtWidgets.QPushButton("Remove selected")
+        self.del_btn.clicked.connect(self._remove_table_row)
+        self.build_btn = QtWidgets.QPushButton("Build")
+        self.build_btn.setEnabled(loaded)
+        self.build_btn.clicked.connect(self._build_monomers)
+        def_row.addWidget(self.add_sugar_btn)
+        def_row.addWidget(self.add_aa_btn)
+        def_row.addWidget(self.del_btn)
+        def_row.addStretch()
+        def_row.addWidget(self.build_btn)
+        col.addLayout(def_row)
+        self._add_table_row("Sugar")
+
+        # --- instance controls ---
+        col.addWidget(QtWidgets.QLabel("Placed subunits (select to move/rotate):"))
+        ctl = QtWidgets.QHBoxLayout()
+        self.inst_list = QtWidgets.QListWidget()
+        self.inst_list.setMinimumWidth(200)
+        self.inst_list.setFixedHeight(150)
+        self.inst_list.currentRowChanged.connect(self._on_instance_selected)
+        self.inst_list.setToolTip("Arrow keys move the selected subunit in X/Y "
+                                  f"({self.NUDGE_STEP_ANG:g} Å; Shift: "
+                                  f"{self.NUDGE_STEP_ANG * self.NUDGE_FAST_FACTOR:g} Å).")
+        self.inst_list.installEventFilter(self)
+        ctl.addWidget(self.inst_list)
+
+        form_box = QtWidgets.QVBoxLayout()
+        self.place_btn = QtWidgets.QPushButton("Place: OFF")
+        self.place_btn.setCheckable(True)
+        self.place_btn.setEnabled(loaded)
+        self.place_btn.toggled.connect(self._on_place_toggled)
+        form_box.addWidget(self.place_btn)
+
+        # Amino-acid only: a second point for the side-chain functional group
+        # (exported as functional_position for the peptide residue).
+        self.func_btn = QtWidgets.QPushButton("Set functional pt: OFF")
+        self.func_btn.setCheckable(True)
+        self.func_btn.setEnabled(False)
+        self.func_btn.setToolTip("Click the image to set the side-chain functional-group "
+                                 "point for the selected amino acid (functional_position).")
+        self.func_btn.toggled.connect(self._on_func_toggled)
+        form_box.addWidget(self.func_btn)
+        self.clear_func_btn = QtWidgets.QPushButton("Clear functional pt")
+        self.clear_func_btn.setEnabled(False)
+        self.clear_func_btn.clicked.connect(self._clear_func_point)
+        form_box.addWidget(self.clear_func_btn)
+
+        grid = QtWidgets.QGridLayout()
+        self.spin = {}
+        specs = [("com_x", "COM X (Å)", -1e5, 1e5, 0.5),
+                 ("com_y", "COM Y (Å)", -1e5, 1e5, 0.5),
+                 ("rx", "Rotate X (°)", -180, 180, 5.0),
+                 ("ry", "Rotate Y (°)", -180, 180, 5.0),
+                 ("rz", "Rotate Z (°)", -180, 180, 5.0)]
+        for i, (key, label, lo, hi, step) in enumerate(specs):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setDecimals(2)
+            sb.valueChanged.connect(self._on_spin_changed)
+            grid.addWidget(QtWidgets.QLabel(label), i, 0)
+            grid.addWidget(sb, i, 1)
+            self.spin[key] = sb
+        form_box.addLayout(grid)
+        form_box.addStretch()
+        ctl.addLayout(form_box)
+        col.addLayout(ctl)
+
+        # --- lipids (point defined chains) ---
+        self._build_lipid_group(col)
+
+        self._build_connection_ui(col)
+
+        # --- export ---
+        csv_row = QtWidgets.QHBoxLayout()
+        lbl = QtWidgets.QLabel("Export to:")
+        csv_row.addWidget(lbl)
+        self.csv_le = QtWidgets.QLineEdit()
+        self.csv_le.setPlaceholderText("monomers.csv")
+        csv_row.addWidget(self.csv_le)
+        browse = QtWidgets.QPushButton("Browse...")
+        browse.clicked.connect(self._browse_csv)
+        csv_row.addWidget(browse)
+        col.addLayout(csv_row)
+
+        export_row = QtWidgets.QHBoxLayout()
+        self.export_coords_btn = QtWidgets.QPushButton("Export coordinates")
+        self.export_coords_btn.setToolTip(
+            "Writes the CSV, positions, orientations, geometry and image files. "
+            "No root, connections or orientation mode needed.")
+        self.export_coords_btn.setEnabled(loaded)
+        self.export_coords_btn.clicked.connect(self._export_coordinates)
+        export_row.addWidget(self.export_coords_btn)
+        self.export_btn = QtWidgets.QPushButton("Export CSV + MISO input YAML")
+        self.export_btn.setToolTip(
+            "Writes the CSV/image companion files and, for sugar-only structures, "
+            "the MISO input YAML (same name, .yml) next to them.")
+        self.export_btn.setEnabled(loaded)
+        self.export_btn.clicked.connect(self._export_csv)
+        export_row.addWidget(self.export_btn)
+        col.addLayout(export_row)
+        self.export_note = QtWidgets.QLabel(
+            "\u26a0 Reminder: open the exported .yml and give it a final inspection "
+            "(units, root, linkages, \u03b1/\u03b2, orientation mode) before running MISO.")
+        self.export_note.setWordWrap(True)
+        self.export_note.setStyleSheet("color: #8a5a00;")
+        col.addWidget(self.export_note)
+        col.addStretch()
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(panel)
+        scroll.setMinimumWidth(440)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        root.addWidget(scroll, stretch=2)
+
+        self._update_default_csv_name()
+
+    def _build_canvas(self, layout):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+        self._fig = Figure(figsize=(5, 5))
+        self._ax = self._fig.add_subplot(111)
+        self._ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
+        self._ax.set_xlabel("col (px)")
+        self._ax.set_ylabel("row (px)")
+        self._fig.tight_layout()
+        self._canvas = FigureCanvas(self._fig)
+        self._canvas.setMinimumHeight(340)
+        self._canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self._canvas.installEventFilter(self)
+        self._nav_toolbar = NavigationToolbar(self._canvas, self)
+        layout.addWidget(self._nav_toolbar)
+        self._zoom_ctl = CanvasZoom(self._canvas, self._ax, self._img.shape, self._nav_toolbar)
+        zoom_buttons(layout, self._zoom_ctl, self)
+        layout.addWidget(self._canvas, stretch=1)
+
+    def _on_include_aa_toggled(self, checked):
+        self.add_aa_btn.setEnabled(bool(checked))
+
+    # ------------------------------------------------------------------ lipid host hooks
+    def _lipid_canvas(self):
+        return getattr(self, "_canvas", None)
+
+    def _lipid_axes(self):
+        return self._ax
+
+    def _lipid_redraw(self):
+        self._redraw_overlay()
+
+    def _lipid_artists(self):
+        return self._overlay_artists
+
+    def _lipid_release_other_pick(self):
+        if self.place_btn.isChecked():
+            self.place_btn.setChecked(False)
+
+    def _add_table_row(self, kind="Sugar", text=""):
+        """Add a subunit row. kind is 'Sugar' or 'Amino acid'."""
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        # Column 0: read-only Type tag (drives how the row is interpreted).
+        type_item = QtWidgets.QTableWidgetItem(kind)
+        type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemIsEditable)
+        self.table.setItem(r, 0, type_item)
+
+        # Column 1: MISO name. For sugars this is the key used in the YAML
+        # (sugars:/experimental_positions:), so it must be user-set (e.g. GlcN).
+        # For amino acids it is filled from the residue code at build time.
+        name_item = QtWidgets.QTableWidgetItem("")
+        if kind == "Sugar":
+            name_item.setToolTip("MISO monomer name used in the YAML, e.g. GlcN, Gal, KDO")
+        else:
+            name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            name_item.setText("—")
+        self.table.setItem(r, 1, name_item)
+
+        # Column 2: SMILES/sugar description or residue code (amino acid).
+        item = QtWidgets.QTableWidgetItem(text)
+        if kind == "Amino acid":
+            item.setToolTip("1- or 3-letter residue code, e.g. N / Asn")
+        else:
+            item.setToolTip(
+                "SMILES or sugar description, e.g. chair KDO, D chair 4C1 glucose, "
+                "beta-D-glucose. Names are resolved via PubChem when you click Build.")
+        self.table.setItem(r, 2, item)
+
+        # Columns 3-4: ring type / anomer — only meaningful for sugars.
+        if kind == "Sugar":
+            ring = QtWidgets.QComboBox()
+            ring.addItems(RING_TYPES)
+            self.table.setCellWidget(r, 3, ring)
+            anom = QtWidgets.QComboBox()
+            anom.addItems(ANOMERS)
+            self.table.setCellWidget(r, 4, anom)
+        else:
+            for c in (3, 4):
+                dash = QtWidgets.QTableWidgetItem("—")
+                dash.setFlags(dash.flags() & ~QtCore.Qt.ItemIsEditable)
+                dash.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.table.setItem(r, c, dash)
+
+        # Column 5: copies.
+        copies = QtWidgets.QSpinBox()
+        copies.setRange(1, 999)
+        copies.setValue(1)
+        self.table.setCellWidget(r, 5, copies)
+
+    def _remove_table_row(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+
+    # ------------------------------------------------------------------ build
+    def _collect_defs(self):
+        """Read the table into a list of per-row dicts describing each subunit."""
+        defs = []
+        for r in range(self.table.rowCount()):
+            type_item = self.table.item(r, 0)
+            kind = (type_item.text().strip() if type_item else "Sugar")
+            name_item = self.table.item(r, 1)
+            name_text = (name_item.text().strip() if name_item else "")
+            text_item = self.table.item(r, 2)
+            text = (text_item.text().strip() if text_item else "")
+            if not text:
+                continue
+            copies = self.table.cellWidget(r, 5).value()
+            if kind == "Sugar":
+                ring = self.table.cellWidget(r, 3).currentText()
+                anom = self.table.cellWidget(r, 4).currentText()
+                # Name is the MISO key; fall back to an auto name if left blank.
+                name = name_text or f"Sugar{r+1}"
+                defs.append({"row": r, "kind": "sugar", "name": name, "smiles": text,
+                             "ring": ring, "anomer": anom, "copies": copies,
+                             "conf_name_hint": None,
+                             "desc": f"{name}: {text} ({ring}/{anom})"})
+            else:
+                name, smiles = resolve_aa(text)
+                defs.append({"row": r, "kind": "aa", "name": name, "smiles": smiles,
+                             "ring": "n/a", "anomer": "n/a", "copies": copies,
+                             "conf_name_hint": name,
+                             "desc": name or f"'{text}' (unknown residue)"})
+        return defs
+
+    def _build_monomers(self):
+        if self._lookup_worker is not None:
+            return
+        defs = self._collect_defs()
+        if not defs:
+            QtWidgets.QMessageBox.warning(
+                self, "Nothing to build", "Add at least one subunit first.")
+            return
+
+        from rdkit import Chem, rdBase
+        requests = []
+        for d in defs:
+            if d["kind"] != "sugar":
+                continue
+            with rdBase.BlockLogs():
+                mol = Chem.MolFromSmiles(d["smiles"])
+            if mol is not None:
+                continue
+            try:
+                request = parse_sugar_description(d["smiles"], d["ring"], d["anomer"])
+            except SugarLookupError as exc:
+                QtWidgets.QMessageBox.warning(self, "Sugar description", f"Row {d['row']+1}: {exc}")
+                return
+            requests.append((d["row"], request))
+        if requests:
+            self._lookup_cancelled = False
+            self._set_lookup_busy(True)
+            self.lookup_status.setText("Checking connection and looking up sugar names in PubChem...")
+            worker = _SugarLookupWorker(requests)
+            worker.signals.finished.connect(self._on_sugar_lookup_finished)
+            self._lookup_worker = worker
+            QtCore.QThreadPool.globalInstance().start(worker)
+            return
+        self._build_resolved_monomers(defs)
+
+    def _cancel_sugar_lookup(self, _result):
+        self._lookup_cancelled = True
+
+    def _set_lookup_busy(self, busy):
+        self.table.setEnabled(not busy)
+        self.build_btn.setEnabled(not busy and self._img is not None)
+        self.add_sugar_btn.setEnabled(not busy)
+        self.add_aa_btn.setEnabled(not busy and self.aa_chk.isChecked())
+        self.del_btn.setEnabled(not busy)
+        self.aa_chk.setEnabled(not busy)
+
+    def _on_sugar_lookup_finished(self, results, title, error):
+        self._lookup_worker = None
+        self._set_lookup_busy(False)
+        if self._lookup_cancelled:
+            return
+        if error:
+            self.lookup_status.setText(error)
+            QtWidgets.QMessageBox.warning(self, title, error)
+            return
+        from rdkit import Chem, rdBase
+        for row, request, result in results:
+            with rdBase.BlockLogs():
+                mol = Chem.MolFromSmiles(result.smiles)
+            if mol is None:
+                error = f"PubChem returned invalid SMILES for '{request.query}'. Enter SMILES manually."
+                self.lookup_status.setText(error)
+                QtWidgets.QMessageBox.warning(self, "Sugar lookup", error)
+                return
+        for row, request, result in results:
+            item = self.table.item(row, 2)
+            item.setText(result.smiles)
+            item.setToolTip(
+                f"PubChem: {request.query}\nCID: {result.cid}\n{result.iupac_name}")
+            name_item = self.table.item(row, 1)
+            if not name_item.text().strip():
+                name_item.setText(request.name)
+            self.table.cellWidget(row, 3).setCurrentText(request.ring)
+            self.table.cellWidget(row, 4).setCurrentText(request.anomer)
+        self.lookup_status.setText("Sugar names resolved via PubChem. SMILES and details remain editable.")
+        self._build_resolved_monomers(self._collect_defs())
+
+    def _build_resolved_monomers(self, defs):
+        engine = None
+        if any(d["kind"] == "sugar" for d in defs):
+            try:
+                engine = import_monomer_engine()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, "MISO engine", f"Could not import monomer builder:\n{exc}")
+                return
+
+        self._templates.clear()
+        self._instances.clear()
+        self.inst_list.clear()
+        self._connections.clear()
+        self._peptide_bonds = []
+        self._peptide_order = None
+        self.connection_table.setRowCount(0)
+
+        # Default placement: image centre in Angstrom.
+        H, W = self._img.shape
+        cx = (W / 2.0) * self._px[0] * 10.0
+        cy = (H / 2.0) * self._px[1] * 10.0
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        failures = []
+        try:
+            for d in defs:
+                r = d["row"]
+                if d["smiles"] is None:
+                    failures.append(f"row {r+1}: {d['desc']}")
+                    continue
+                if d["kind"] == "sugar":
+                    tmpl = self._build_sugar_template(engine, d["smiles"], d["ring"], d["anomer"])
+                else:
+                    tmpl = self._build_aa_template(d["smiles"], d["conf_name_hint"])
+                    # Reflect the resolved residue name back into the Name column.
+                    nm = self.table.item(r, 1)
+                    if nm is not None:
+                        nm.setText(d["name"] or "")
+                if tmpl is None:
+                    failures.append(f"row {r+1}: {d['desc']}")
+                    continue
+                self._templates[r] = tmpl
+                for c in range(d["copies"]):
+                    self._instances.append({
+                        "label": f"{d['name']}.{r+1}.{c+1}",
+                        "name": d["name"], "kind": d["kind"],
+                        "smiles": d["smiles"], "ring": d["ring"], "anomer": d["anomer"],
+                        "conf_name": tmpl["conf_name"],
+                        "rel": tmpl["rel"], "atom_types": tmpl["atom_types"],
+                        "bonds": tmpl["bonds"],
+                        "rigid": tmpl.get("rigid"),      # exact MISO monomer data (sugars)
+                        "functional_rel": tmpl.get("functional_rel"),  # AA auto functional-group offset from COM
+                        "com": [cx, cy, 0.0], "euler": [0.0, 0.0, 0.0],
+                        "func_pos": None,                # AA functional_position (x, y) — manual override; falls back to functional_rel (auto) when None
+                    })
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        for inst in self._instances:
+            self.inst_list.addItem(f"{inst['label']}  [{inst['conf_name'].split('_rank')[0]}]")
+        self._refresh_connection_units()
+        self._redraw_overlay()
+        if self._instances:
+            self.inst_list.setCurrentRow(0)
+
+        msg = f"Built {len(self._instances)} instance(s) from {len(self._templates)} subunit(s)."
+        if failures:
+            msg += "\n\nCould not build (no matching conformer / unknown residue):\n  " + "\n  ".join(failures)
+        QtWidgets.QMessageBox.information(self, "Build", msg)
+
+    @staticmethod
+    def _template_from_mol(mol, conf_name, functional_atom_indices=None, ca_atom_index=None):
+        """Heavy-atom coordinates/bonds/anchor from an embedded RDKit mol.
+
+        functional_atom_indices, if given, are atom indices in `mol` (still
+        with explicit H at this point) whose centroid is the amino acid's
+        side-chain functional point; it is returned as functional_rel,
+        relative to the anchor in the same frame as `rel`, for automatic
+        functional-position placement without a manual click.
+
+        ca_atom_index, if given, is the Cα atom's index in `mol`: it becomes
+        the anchor (COM), since MISO places/rotates each residue by treating
+        this point as the Cα, not as the molecule's actual center of mass.
+        Without it (e.g. sugars, called separately, never pass this), the
+        anchor falls back to the mass-weighted centroid of all heavy atoms.
+        """
+        from rdkit.Chem import RemoveHs
+        conf_before = mol.GetConformer()
+        functional_abs = None
+        if functional_atom_indices:
+            pts = np.array([[*conf_before.GetAtomPosition(i)] for i in functional_atom_indices])
+            functional_abs = pts.mean(axis=0)
+        ca_abs = None
+        if ca_atom_index is not None:
+            ca_abs = np.array([*conf_before.GetAtomPosition(ca_atom_index)], dtype=float)
+        mol = RemoveHs(mol)                       # H are added at the very end
+        conf = mol.GetConformer()
+        coords, atom_types, masses = [], [], []
+        for atom in mol.GetAtoms():
+            pos = conf.GetAtomPosition(atom.GetIdx())
+            coords.append([pos.x, pos.y, pos.z])
+            atom_types.append(atom.GetSymbol())
+            masses.append(atom.GetMass())
+        coords = np.asarray(coords, dtype=float)
+        com = ca_abs if ca_abs is not None else np.average(coords, weights=np.asarray(masses), axis=0)
+        bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
+        functional_rel = (functional_abs - com).tolist() if functional_abs is not None else None
+        return {"conf_name": conf_name, "rel": coords - com,
+                "atom_types": atom_types, "bonds": bonds,
+                "functional_rel": functional_rel}
+
+    def _build_sugar_template(self, engine, smiles, ring, anom):
+        return build_sugar_template(engine, smiles, ring, anom)
+
+    def _build_aa_template(self, smiles, name):
+        """Single lowest-energy conformer for an amino acid (embed + MMFF)."""
+        return build_aa_template(smiles, name)
+
+    # ------------------------------------------------------------------ geometry
+    def _ang_to_pixel(self, x_ang, y_ang):
+        H, W = self._img.shape
+        col = x_ang / (self._px[0] * 10.0)
+        orig_y = y_ang / (self._px[1] * 10.0)
+        row = (orig_y - 1.0) if self._scan_dir == "down" else (H - 1.0 - orig_y)
+        return col, row
+
+    def _pixel_to_ang(self, col, row):
+        H, W = self._img.shape
+        col = int(max(0, min(W - 1, round(col))))
+        row = int(max(0, min(H - 1, round(row))))
+        orig_x = col
+        orig_y = (row + 1) if self._scan_dir == "down" else (H - 1 - row)
+        oy = min(max(orig_y, 0), H - 1)
+        height = float(self._img[oy, orig_x])
+        x_ang = orig_x * self._px[0] * 10.0
+        y_ang = orig_y * self._px[1] * 10.0
+        return x_ang, y_ang, height
+
+    def _instance_abs_coords(self, inst):
+        """Rotate the monomer and translate to its COM (Angstrom)."""
+        Rm = euler_to_matrix(*inst["euler"])
+        rotated = inst["rel"] @ Rm.T
+        return rotated + np.asarray(inst["com"], dtype=float)
+
+    def _auto_func_pos(self, inst):
+        """Absolute (x, y) for the amino acid's automatically-identified
+        side-chain functional point, rotated/translated with the instance's
+        current pose. None when the residue has no defined functional group
+        (e.g. Ala, Gly) or isn't an amino acid.
+        """
+        rel = inst.get("functional_rel")
+        if rel is None:
+            return None
+        Rm = euler_to_matrix(*inst["euler"])
+        abs_pos = np.asarray(rel, dtype=float) @ Rm.T + np.asarray(inst["com"], dtype=float)
+        return [abs_pos[0], abs_pos[1]]
+
+    def _effective_func_pos(self, inst):
+        """Manual functional-point override if the user set one (via "Set
+        functional pt"), else the automatically-identified functional point,
+        else None.
+        """
+        if inst.get("func_pos") is not None:
+            return inst["func_pos"]
+        return self._auto_func_pos(inst)
+
+    # ------------------------------------------------------------------ selection
+    def _active_instance(self):
+        r = self.inst_list.currentRow()
+        if 0 <= r < len(self._instances):
+            return self._instances[r]
+        return None
+
+    def _on_instance_selected(self, _row):
+        inst = self._active_instance()
+        if inst is None:
+            self.func_btn.setEnabled(False)
+            self.clear_func_btn.setEnabled(False)
+            return
+        self._updating = True
+        self.spin["com_x"].setValue(inst["com"][0])
+        self.spin["com_y"].setValue(inst["com"][1])
+        self.spin["rx"].setValue(inst["euler"][0])
+        self.spin["ry"].setValue(inst["euler"][1])
+        self.spin["rz"].setValue(inst["euler"][2])
+        self._updating = False
+        # Functional-point controls apply to amino acids only.
+        is_aa = inst.get("kind") == "aa"
+        self.func_btn.setEnabled(is_aa and self._img is not None)
+        self.clear_func_btn.setEnabled(is_aa and inst.get("func_pos") is not None)
+        if not is_aa and self.func_btn.isChecked():
+            self.func_btn.setChecked(False)
+        self._redraw_overlay()
+
+    def _on_spin_changed(self, _val):
+        if self._updating:
+            return
+        inst = self._active_instance()
+        if inst is None:
+            return
+        inst["com"][0] = self.spin["com_x"].value()
+        inst["com"][1] = self.spin["com_y"].value()
+        inst["euler"] = [self.spin["rx"].value(), self.spin["ry"].value(),
+                         self.spin["rz"].value()]
+        self._redraw_overlay()
+
+    # ------------------------------------------------------------------ keyboard
+    _NUDGE_KEYS = {QtCore.Qt.Key_Left: (-1, 0), QtCore.Qt.Key_Right: (1, 0),
+                   QtCore.Qt.Key_Up: (0, 1), QtCore.Qt.Key_Down: (0, -1)}
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.KeyPress
+                and obj in (getattr(self, "inst_list", None), getattr(self, "_canvas", None))
+                and event.key() in self._NUDGE_KEYS
+                and not event.modifiers() & ~(QtCore.Qt.ShiftModifier | QtCore.Qt.KeypadModifier)
+                and self._active_instance() is not None):
+            dx, dy = self._NUDGE_KEYS[event.key()]
+            fast = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+            self._nudge_active(dx, dy, fast)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _nudge_active(self, dx_screen, dy_screen, fast=False):
+        """Move the selected subunit by one step in screen directions."""
+        inst = self._active_instance()
+        if inst is None:
+            return
+        step = self.NUDGE_STEP_ANG * (self.NUDGE_FAST_FACTOR if fast else 1)
+        # The image is drawn origin="lower"; for upward scans Y (Å) grows
+        # downward on screen (see _ang_to_pixel).
+        y_sign = 1 if getattr(self, "_scan_dir", "up") == "down" else -1
+        inst["com"][0] += dx_screen * step
+        inst["com"][1] += dy_screen * step * y_sign
+        self._updating = True
+        self.spin["com_x"].setValue(inst["com"][0])
+        self.spin["com_y"].setValue(inst["com"][1])
+        self._updating = False
+        self._redraw_overlay()
+
+    # ------------------------------------------------------------------ placing
+    def _on_place_toggled(self, active):
+        canvas = getattr(self, "_canvas", None)
+        if canvas is None:
+            self.place_btn.setChecked(False)
+            return
+        if active:
+            if getattr(self, "lipid_pick_btn", None) is not None and self.lipid_pick_btn.isChecked():
+                self.lipid_pick_btn.setChecked(False)
+            if self.func_btn.isChecked():
+                self.func_btn.setChecked(False)
+            self._place_cid = canvas.mpl_connect("button_press_event", self._on_canvas_click)
+            self.place_btn.setText("Place: ON (click image)")
+        else:
+            if self._place_cid is not None:
+                canvas.mpl_disconnect(self._place_cid)
+                self._place_cid = None
+            self.place_btn.setText("Place: OFF")
+
+    def _on_func_toggled(self, active):
+        canvas = getattr(self, "_canvas", None)
+        if canvas is None:
+            self.func_btn.setChecked(False)
+            return
+        if active:
+            if self.place_btn.isChecked():
+                self.place_btn.setChecked(False)
+            if getattr(self, "lipid_pick_btn", None) is not None and self.lipid_pick_btn.isChecked():
+                self.lipid_pick_btn.setChecked(False)
+            self._func_cid = canvas.mpl_connect("button_press_event", self._on_func_canvas_click)
+            self.func_btn.setText("Set functional pt: ON (click image)")
+        else:
+            if self._func_cid is not None:
+                canvas.mpl_disconnect(self._func_cid)
+                self._func_cid = None
+            self.func_btn.setText("Set functional pt: OFF")
+
+    def _on_func_canvas_click(self, event):
+        if event.inaxes is None or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        inst = self._active_instance()
+        if inst is None or inst.get("kind") != "aa":
+            return
+        x_ang, y_ang, _h = self._pixel_to_ang(event.xdata, event.ydata)
+        inst["func_pos"] = [x_ang, y_ang]
+        self.clear_func_btn.setEnabled(True)
+        self.func_btn.setChecked(False)   # one click sets it
+        self._redraw_overlay()
+
+    def _clear_func_point(self):
+        inst = self._active_instance()
+        if inst is None:
+            return
+        inst["func_pos"] = None
+        self.clear_func_btn.setEnabled(False)
+        self._redraw_overlay()
+
+    def _on_canvas_click(self, event):
+        if event.inaxes is None or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        inst = self._active_instance()
+        if inst is None:
+            QtWidgets.QMessageBox.information(self, "No instance", "Select a monomer instance first.")
+            return
+        x_ang, y_ang, height = self._pixel_to_ang(event.xdata, event.ydata)
+        inst["com"] = [x_ang, y_ang, height]
+        self._updating = True
+        self.spin["com_x"].setValue(x_ang)
+        self.spin["com_y"].setValue(y_ang)
+        self._updating = False
+        self._redraw_overlay()
+
+    # ------------------------------------------------------------------ drawing
+    def _clear_overlay(self):
+        for art in self._overlay_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._overlay_artists = []
+
+    def _redraw_overlay(self):
+        ax = getattr(self, "_ax", None)
+        canvas = getattr(self, "_canvas", None)
+        if ax is None or canvas is None:
+            return
+        self._clear_overlay()
+        active = self._active_instance()
+        for inst in self._instances:
+            abs_c = self._instance_abs_coords(inst)
+            cols, rows, colors, sizes = [], [], [], []
+            px = {}
+            for i, (xyz, sym) in enumerate(zip(abs_c, inst["atom_types"])):
+                c, rw = self._ang_to_pixel(xyz[0], xyz[1])
+                px[i] = (c, rw)
+                cols.append(c)
+                rows.append(rw)
+                colors.append(ATOM_COLORS.get(sym, "#8e24aa"))
+                sizes.append(ATOM_SIZE.get(sym, 22))
+            is_active = inst is active
+            for (a, b) in inst["bonds"]:
+                (ca, ra), (cb, rb) = px[a], px[b]
+                ln, = ax.plot([ca, cb], [ra, rb], "-",
+                              color="#4fc3f7" if is_active else "#90a4ae",
+                              lw=1.6 if is_active else 1.0, zorder=18, alpha=0.9)
+                self._overlay_artists.append(ln)
+            if cols:
+                sc = ax.scatter(cols, rows, c=colors, s=sizes,
+                                edgecolors="white", linewidths=0.4,
+                                zorder=20, alpha=0.95)
+                self._overlay_artists.append(sc)
+            # COM marker + label
+            comc, comr = self._ang_to_pixel(inst["com"][0], inst["com"][1])
+            star, = ax.plot([comc], [comr], marker="*",
+                            color="#ffd600" if is_active else "#ffab00",
+                            ms=13 if is_active else 10, mec="black", mew=0.6, zorder=22)
+            lbl = ax.annotate(inst["label"], xy=(comc, comr), xytext=(5, 5),
+                              textcoords="offset points", color="#ffee00",
+                              fontsize=8, zorder=23)
+            self._overlay_artists.extend([star, lbl])
+            # Amino-acid functional-group point (functional_position):
+            # manual override if set, else the automatically-identified one.
+            fp = self._effective_func_pos(inst)
+            if fp is not None:
+                fc, fr = self._ang_to_pixel(fp[0], fp[1])
+                line, = ax.plot([comc, fc], [comr, fr], "--",
+                                color="#00e5ff" if is_active else "#4dd0e1",
+                                lw=1.0, zorder=21, alpha=0.9)
+                fm, = ax.plot([fc], [fr], marker="^",
+                              color="#00e5ff" if is_active else "#4dd0e1",
+                              ms=10 if is_active else 8, mec="black", mew=0.5, zorder=22)
+                self._overlay_artists.extend([line, fm])
+        self._draw_lipids(ax, atom_colors=ATOM_COLORS)
+        canvas.draw_idle()
+
+    # ------------------------------------------------------------------ MISO connections
+    SUPPORTS_PEPTIDE = True
+    CONNECTION_HINT = (
+        "Connect named sugars explicitly; branches are allowed. Rebuilding clears "
+        "connections, peptide bonds and root.")
+
+    def _assistant_blocker(self):
+        if self._lookup_worker is not None:
+            return "Wait for the sugar-name lookup to finish first."
+        return super()._assistant_blocker()
+
+    def _functional_point_indices(self):
+        """{amino acid unit index: circle index of its side-chain point}.
+
+        Same order as the positions CSV: one COM point per unit first, then the
+        side-chain points of the amino acids that have one.
+        """
+        mapping = {}
+        index = len(self._instances)
+        for i, inst in enumerate(self._instances):
+            if inst.get("kind") == "aa" and self._effective_func_pos(inst) is not None:
+                mapping[i] = index
+                index += 1
+        return mapping
+
+    def _make_miso_config(self, out_path):
+        mode = self.orientation_combo.currentData()
+        if mode is None:
+            raise MISOExportError("Choose whether to keep or optimize the positioned orientations.")
+        return build_miso_config(
+            self._instances, self._connections, self.root_combo.currentData(),
+            mode, out_path, self._sxm_path, has_lipids=bool(self._lipids),
+            lipids=self._lipid_bonds(),
+            peptide_bonds=self._peptide_bonds,
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None,
+            functional_points=self._functional_point_indices())
+
+    # ------------------------------------------------------------------ export
+    def _browse_csv(self):
+        default_name = self.csv_le.text().strip() or "monomers.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save CSV", default_name, "CSV Files (*.csv);;All Files (*)")
+        if path:
+            self.csv_le.setText(path)
+
+    def _export_coordinates(self):
+        placed_lipids = self._placed_lipids()
+        if not self._instances and not placed_lipids:
+            QtWidgets.QMessageBox.warning(
+                self, "Nothing to export", "Build/place subunits or lipids first.")
+            return
+        out_path = self.csv_le.text().strip() or "monomers.csv"
+        try:
+            written = self._write_csv_exports(out_path)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Export failed", f"Could not export the coordinates:\n{exc}")
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Done",
+            "Saved coordinates and orientations:\n  " + "\n  ".join(written)
+            + "\n\nNo MISO YAML was written. Use 'Export CSV + MISO input YAML' "
+              "once the root, connections and orientation mode are set.")
+
+    def _export_csv(self):
+        placed_lipids = self._placed_lipids()
+        if not self._instances and not placed_lipids:
+            QtWidgets.QMessageBox.warning(
+                self, "Nothing to export", "Build/place subunits or lipids first.")
+            return
+        out_path = self.csv_le.text().strip() or "monomers.csv"
+        config = None
+        try:
+            configs = self._miso_configs(out_path)
+            config = configs[0][1]
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "MISO YAML export",
+                f"{exc}\n\nNothing was written. To save just the coordinates "
+                "and orientations, use 'Export coordinates'.")
+            return
+        export_errors = (OSError,)
+        if config is not None:
+            try:
+                import yaml
+            except ImportError:
+                QtWidgets.QMessageBox.critical(
+                    self, "Missing dependency", "PyYAML is required for MISO YAML export.")
+                return
+            export_errors += (yaml.YAMLError,)
+        yaml_path = configs[0][0]
+        try:
+            written = self._write_csv_exports(out_path)
+            for path, cfg in configs:
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(cfg, handle, sort_keys=False, allow_unicode=True)
+        except export_errors as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Export failed",
+                f"Could not complete the MISO export:\n{exc}\n\n"
+                "Some companion files may already have been written. Fix the error and export again.")
+            return
+        written.extend(path.name for path, _cfg in configs)
+        self.viewer.last_monomer_yaml = str(yaml_path.resolve())
+        QtWidgets.QMessageBox.information(
+            self, "Done",
+            f"Saved {len(self._instances)} unit(s):\n  "
+            + "\n  ".join(written)
+            + (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}" if len(configs) == 1 else
+               f"\n\n{len(configs)} MISO input YAMLs (variants) in:\n  {yaml_path.resolve().parent}"
+               "\nRun MISO uses the first one.")
+            + self._lipid_yaml_note()
+            + "\n\nPlease give the YAML a final inspection (units, root, linkages, "
+              "\u03b1/\u03b2, orientation mode) before running MISO. "
+              "Open Run MISO to use this YAML and its companion files.")
+
+    def _write_csv_exports(self, out_path):
+        import csv
+        written = []
+        placed_lipids = self._placed_lipids()
+
+        if self._instances:
+            header = ["Instance", "SMILES", "RingType", "Anomer", "Conformer",
+                      "COM_X (Angstrom)", "COM_Y (Angstrom)", "COM_Z (Angstrom)",
+                      "Rot_X (deg)", "Rot_Y (deg)", "Rot_Z (deg)",
+                      "quat_x", "quat_y", "quat_z", "quat_w",
+                      "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"]
+            with open(out_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                for inst in self._instances:
+                    Rm = euler_to_matrix(*inst["euler"])
+                    q = matrix_to_quaternion(Rm)
+                    row = [inst["label"], inst["smiles"], inst["ring"], inst["anomer"],
+                           inst["conf_name"],
+                           f"{inst['com'][0]:.6f}", f"{inst['com'][1]:.6f}", f"{inst['com'][2]:.6f}",
+                           f"{inst['euler'][0]:.4f}", f"{inst['euler'][1]:.4f}", f"{inst['euler'][2]:.4f}",
+                           f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
+                    row += [f"{v:.8f}" for v in Rm.flatten()]
+                    w.writerow(row)
+            written.append(Path(out_path).name)
+            written += [Path(p).name for p in self._export_miso_inputs(out_path)]
+            written += [Path(p).name for p in self._export_monomer_pickle(out_path)]
+
+        if placed_lipids:
+            written += [Path(p).name for p in self._export_lipids_csv(out_path, placed_lipids)]
+
+        self._export_png(out_path)
+        written.append(Path(out_path).with_suffix(".png").name)
+        return written
+
+    def _export_miso_inputs(self, out_path):
+        """Write MISO-ready positions (circle_input) + orientations (by point index).
+
+        <stem>_positions.csv    -> drop-in ``circle_input_path``; one row per placed
+                                   subunit, point index = row order (the value used
+                                   in ``experimental_positions``).
+        <stem>_orientations.csv -> ``orientation_csv_path``; ``Point`` + row-major
+                                   3x3 rotation R00..R22 (+quaternion) consumed by
+                                   MISO's fixed-orientation mode. Columns match
+                                   pipeline.load_orientations.
+        """
+        import csv
+        stem = Path(out_path).with_suffix("")
+        pos_path = f"{stem}_positions.csv"
+        ori_path = f"{stem}_orientations.csv"
+
+        with open(pos_path, "w", newline="") as f:
+            w = csv.writer(f)
+            # Name/Instance/Role are extra reference columns; MISO's
+            # load_circle_data reads only the "(Angstrom)"/Height columns, so
+            # they are ignored there. Point index = row order.
+            #   Role=COM        -> the subunit centre (sugar experimental_positions
+            #                       / amino-acid ca_position)
+            #   Role=functional -> an amino-acid side-chain point
+            #                       (peptide residue functional_position)
+            w.writerow(["Point", "Name", "Instance", "Role", "Original_X", "Original_Y",
+                        "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
+            idx = 0
+            # First: one COM point per placed subunit (indices 0..N-1) so these
+            # line up with the orientations CSV, which is keyed by the same index.
+            for inst in self._instances:
+                cx, cy, cz = inst["com"][0], inst["com"][1], inst["com"][2]
+                col, row = self._ang_to_pixel(cx, cy)
+                w.writerow([idx, inst.get("name", ""), inst["label"], "COM",
+                            int(round(col)), int(round(row)),
+                            f"{cx:.6f}", f"{cy:.6f}", f"{cz:.6f}", 0.0])
+                idx += 1
+            # Then: amino-acid functional-group points (manual override, or
+            # auto-identified when the residue has a known one), appended
+            # after all COMs.
+            for inst in self._instances:
+                if inst.get("kind") != "aa":
+                    continue
+                fp = self._effective_func_pos(inst)
+                if fp is None:
+                    continue
+                col, row = self._ang_to_pixel(fp[0], fp[1])
+                w.writerow([idx, inst.get("name", ""), inst["label"], "functional",
+                            int(round(col)), int(round(row)),
+                            f"{fp[0]:.6f}", f"{fp[1]:.6f}", "0.000000", 0.0])
+                idx += 1
+
+        with open(ori_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Point", "Instance", "Type", "Conformer",
+                        "quat_x", "quat_y", "quat_z", "quat_w",
+                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"])
+            for i, inst in enumerate(self._instances):
+                Rm = euler_to_matrix(*inst["euler"])
+                q = matrix_to_quaternion(Rm)
+                kind = inst.get("kind", "sugar")
+                row = [i, inst["label"], kind, inst["conf_name"],
+                       f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
+                row += [f"{v:.8f}" for v in Rm.flatten()]
+                w.writerow(row)
+        return [pos_path, ori_path]
+
+    def _export_monomer_pickle(self, out_path):
+        """Pickle exact per-sugar rigid monomer data so MISO reuses this geometry.
+
+        Produces {name: rigid_body_data} matching pipeline.extract_monomer_data
+        output (each rigid_body_data is {conformer_name: {COM, relative_coordinates,
+        atom_types, quaternion, carbon_map, oh_map, anomer, anomeric_oxygen_idx}}).
+        MISO loads this via monomer_data_path and skips conformer regeneration, so
+        the placed geometry is reproduced exactly. Amino acids are omitted (MISO
+        builds those from the peptide sequence, not from this table).
+        """
+        import pickle
+        monomer_data = {}
+        for inst in self._instances:
+            if inst.get("kind") != "sugar" or inst.get("rigid") is None:
+                continue
+            # Instances of the same Name share geometry; first one wins.
+            monomer_data.setdefault(inst["name"], inst["rigid"])
+        if not monomer_data:
+            return []
+        pkl_path = f"{Path(out_path).with_suffix('')}_monomer_data.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(monomer_data, f)
+        return [pkl_path]
+
+    def _export_png(self, csv_path):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        if self._img is None:
+            return
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+        ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
+        for inst in self._instances:
+            abs_c = self._instance_abs_coords(inst)
+            px = {i: self._ang_to_pixel(xyz[0], xyz[1]) for i, xyz in enumerate(abs_c)}
+            for (a, b) in inst["bonds"]:
+                (ca, ra), (cb, rb) = px[a], px[b]
+                ax.plot([ca, cb], [ra, rb], "-", color="#90a4ae", lw=0.9, zorder=18)
+            for i, sym in enumerate(inst["atom_types"]):
+                c, rw = px[i]
+                ax.plot(c, rw, marker="o", ms=3.5,
+                        color=ATOM_COLORS.get(sym, "#8e24aa"),
+                        mec="white", mew=0.3, zorder=20)
+            comc, comr = self._ang_to_pixel(inst["com"][0], inst["com"][1])
+            ax.plot(comc, comr, marker="*", color="#ffd600", ms=10, mec="black", mew=0.5, zorder=22)
+            ax.annotate(inst["label"], xy=(comc, comr), xytext=(4, 4),
+                        textcoords="offset points", color="#ffee00", fontsize=7, zorder=23)
+            fp = self._effective_func_pos(inst)
+            if fp is not None:
+                fc, fr = self._ang_to_pixel(fp[0], fp[1])
+                ax.plot([comc, fc], [comr, fr], "--", color="#00bcd4", lw=0.8, zorder=21)
+                ax.plot(fc, fr, marker="^", color="#00bcd4", ms=7, mec="black", mew=0.4, zorder=22)
+        self._draw_lipids_export(ax, ATOM_COLORS)
+        ax.set_xlabel("col (px)")
+        ax.set_ylabel("row (px)")
+        ax.set_title(Path(csv_path).stem)
+        fig.tight_layout()
+        fig.savefig(str(Path(csv_path).with_suffix(".png")), dpi=150)
+        plt.close(fig)
+
+    def _update_default_csv_name(self):
+        stem = ""
+        try:
+            if self._sxm_path is not None:
+                stem = self._sxm_path.stem
+            elif self.viewer.preview_canvas.views:
+                stem = Path(self.viewer.preview_canvas.views[0].get("file_name", "")).stem
+        except Exception:
+            pass
+        if stem:
+            self.csv_le.setText(f"{stem}_monomers.csv")
+
+    def closeEvent(self, event):
+        canvas = getattr(self, "_canvas", None)
+        if canvas is not None:
+            if self._place_cid is not None:
+                canvas.mpl_disconnect(self._place_cid)
+            if self._func_cid is not None:
+                canvas.mpl_disconnect(self._func_cid)
+            self._disconnect_lipid_events(canvas)
+        super().closeEvent(event)
