@@ -9,6 +9,29 @@ from .bonds_creation import (
 )
 from ..geometry.geometry_utils import calculate_alignment_rotation
 from .building_chain import add_hydrogens_with_openbabel
+from . import pdb_export
+
+
+def _assign_residues_safe(combined_rw, processed_mols):
+    """Name sugar residues right after combine, before any atom removals.
+
+    Failures here must never break the SDF pipeline — the residue map is only
+    used by the (optional) coarse-grained export, so on any error we log and
+    carry on with the molecule unnamed.
+    """
+    try:
+        pdb_export.assign_sugar_residues(combined_rw, processed_mols)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  ! residue naming skipped (CG export will be unavailable): {exc}")
+
+
+def _finalize_residues_safe(final_mol):
+    """Name grown-on fragments and read back the unit -> atom_indices map."""
+    try:
+        return pdb_export.finalize_residue_info(final_mol)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  ! residue finalization skipped (CG export unavailable): {exc}")
+        return None
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -1200,6 +1223,10 @@ def export_complete_structure_with_petn_and_lipids(
     # Step 2: Combine molecules
     combined_rw = combine_molecules(processed_mols)
 
+    # Name sugar residues now, while carbon_map's local indices are still valid
+    # (later removals shift indices but MonomerInfo travels with the atoms).
+    _assign_residues_safe(combined_rw, processed_mols)
+
     # Step 3: Add glycosidic bonds
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
 
@@ -1286,8 +1313,9 @@ def export_complete_structure_with_petn_and_lipids(
         print(f"\nFinal molecule statistics:")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
-    
-    return final_mol
+
+    residue_index = _finalize_residues_safe(final_mol)
+    return final_mol, residue_index
 
 def export_complete_glycopeptide(
     chain_dict,
@@ -1318,6 +1346,9 @@ def export_complete_glycopeptide(
 
     # Step 2: Combine sugar molecules
     combined_rw = combine_molecules(processed_mols)
+
+    # Name sugar residues now, before removals shift local indices.
+    _assign_residues_safe(combined_rw, processed_mols)
 
     # Step 3: Add glycosidic bonds (sugar-sugar)
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
@@ -1428,8 +1459,9 @@ def export_complete_glycopeptide(
         # print(f"\n✓ Saved to {filename}.sdf")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
-    
-    return final_mol, enforced_atoms
+
+    residue_index = _finalize_residues_safe(final_mol)
+    return final_mol, enforced_atoms, residue_index
 
 def snapshot_ring_positions(chain_dict):
     """
