@@ -139,14 +139,6 @@ script or terminal required.
 > The runner uses only the YAML + CSV (uniform surface gravity). It does not require
 > the STM grid NPZ.
 
-**Updating the MISO engine.** Replace the contents of the `MISO/` folder with the new
-version and press **Run MISO**. Before each run the viewer reads `MISO/module_B.py`,
-sends only the command line options that version accepts, and writes lines starting with
-`[MISO] Note:` at the top of the log. These say which options were skipped, whether the
-compression steps or gravity values may be ignored, and whether a YAML section such as
-`Phosphate` or `PEtN` is no longer mentioned by the engine. If the viewer cannot drive the
-new version at all, it stops with a message before anything runs.
-
 ### Workflow
 
 1. Open your SXM scan in SXM Viewer
